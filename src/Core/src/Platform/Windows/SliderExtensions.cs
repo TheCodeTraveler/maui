@@ -108,7 +108,7 @@ namespace Microsoft.Maui.Platform
 
 			if (thumbImageSource == null)
 			{
-				nativeSlider.ThumbImageSource = null;
+				MauiSlider.ThumbImageSource = null;
 
 				var thumb = nativeSlider.GetFirstDescendant<Thumb>();
 
@@ -145,10 +145,17 @@ namespace Microsoft.Maui.Platform
 
 						if (nativeSlider.Parent is FrameworkElement frameworkElement)
 							frameworkElement.InvalidateMeasure();
-					};
+					}
+<<<<<<< TODO: Unmerged change from project 'Core(net9.0-windows10.0.20348.0)', Before:
+				nativeSlider.ThumbImageSource = nativeThumbImageSource?.Value;
+=======
+				MauiSlider.ThumbImageSource = nativeThumbImageSource?.Value;
+>>>>>>> After
+
+					;
 				}
 
-				nativeSlider.ThumbImageSource = nativeThumbImageSource?.Value;
+				MauiSlider.ThumbImageSource = nativeThumbImageSource?.Value;
 			}
 		}
 	}

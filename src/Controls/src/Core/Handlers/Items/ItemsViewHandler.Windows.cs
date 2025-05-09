@@ -582,7 +582,8 @@ namespace Microsoft.Maui.Controls.Handlers.Items
 
 				default:
 					return elementBounds.Left < containerBounds.Right && elementBounds.Right > containerBounds.Left;
-			};
+			}
+			;
 		}
 
 		async void ScrollToRequested(object sender, ScrollToRequestEventArgs args)
@@ -633,7 +634,7 @@ namespace Microsoft.Maui.Controls.Handlers.Items
 
 					// CollectionGroups property is of type IObservableVector, but these objects should implement ICollectionViewGroup
 					var itemGroup = CollectionViewSource.View.CollectionGroups[args.GroupIndex] as ICollectionViewGroup;
-					if (itemGroup != null && 
+					if (itemGroup != null &&
 						args.Index < itemGroup.GroupItems.Count)
 					{
 						return itemGroup.GroupItems[args.Index];
