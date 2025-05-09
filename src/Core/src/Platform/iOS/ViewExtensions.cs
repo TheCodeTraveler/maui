@@ -690,7 +690,8 @@ namespace Microsoft.Maui.Platform
 						uiView.BeginInvokeOnMainThread(() => OnLoadedCheck(null));
 					}
 				}
-			};
+			}
+			;
 
 			return disposable;
 		}
@@ -750,7 +751,8 @@ namespace Microsoft.Maui.Platform
 					disposable = null;
 					action();
 				}
-			};
+			}
+			;
 
 			return disposable;
 		}
