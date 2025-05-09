@@ -5,6 +5,7 @@ using System.Linq;
 using Foundation;
 using ObjCRuntime;
 using UIKit;
+using Microsoft.Maui.Controls.Platform;
 
 namespace Microsoft.Maui.Controls.Handlers.Items2
 {
@@ -44,6 +45,7 @@ namespace Microsoft.Maui.Controls.Handlers.Items2
 				CollectionView.PerformBatchUpdates(null, _ =>
 				{
 					CollectionView.SelectItem(index, true, UICollectionViewScrollPosition.None);
+					CollectionView.CellForItem(index)?.UpdateSelectedAccessibility(true);
 				});
 			}
 		}
@@ -53,13 +55,10 @@ namespace Microsoft.Maui.Controls.Handlers.Items2
 		{
 			var selectedItemIndexes = CollectionView.GetIndexPathsForSelectedItems();
 
-			CollectionView.PerformBatchUpdates(null, _ =>
+			foreach (var index in selectedItemIndexes)
 			{
-				foreach (var index in selectedItemIndexes)
-				{
-					CollectionView.DeselectItem(index, true);
-				}
-			});
+				CollectionView.DeselectItem(index, true);
+			}
 		}
 
 		void FormsSelectItem(NSIndexPath indexPath)
@@ -77,6 +76,8 @@ namespace Microsoft.Maui.Controls.Handlers.Items2
 					ItemsView.SelectedItems.Add(GetItemAtIndex(indexPath));
 					break;
 			}
+
+			CollectionView.CellForItem(indexPath)?.UpdateSelectedAccessibility(true);
 		}
 
 		void FormsDeselectItem(NSIndexPath indexPath)
@@ -93,6 +94,8 @@ namespace Microsoft.Maui.Controls.Handlers.Items2
 					ItemsView.SelectedItems.Remove(GetItemAtIndex(indexPath));
 					break;
 			}
+
+			CollectionView.CellForItem(indexPath)?.UpdateSelectedAccessibility(false);
 		}
 
 		internal void UpdatePlatformSelection()
@@ -132,6 +135,10 @@ namespace Microsoft.Maui.Controls.Handlers.Items2
 		{
 			var mode = ItemsView.SelectionMode;
 
+			// We want to make sure we clear the selection trait before we switch modes.
+			// If we do this after we switch modes, cells that are selected may not show up as selected anymore.
+			CollectionView.ClearSelectedAccessibilityTraits(CollectionView.GetIndexPathsForSelectedItems());
+
 			switch (mode)
 			{
 				case SelectionMode.None:
@@ -152,6 +159,7 @@ namespace Microsoft.Maui.Controls.Handlers.Items2
 			}
 
 			UpdatePlatformSelection();
+			CollectionView.UpdateAccessibilityTraits(ItemsView);
 		}
 
 		void SynchronizePlatformSelectionWithSelectedItems()
@@ -164,10 +172,7 @@ namespace Microsoft.Maui.Controls.Handlers.Items2
 				var itemAtPath = GetItemAtIndex(path);
 				if (!selectedItems.Contains(itemAtPath))
 				{
-					CollectionView.PerformBatchUpdates(null, _ =>
-					{
-						CollectionView.DeselectItem(path, true);
-					});
+					CollectionView.DeselectItem(path, true);
 				}
 				else
 				{

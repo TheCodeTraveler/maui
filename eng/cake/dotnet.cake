@@ -114,7 +114,11 @@ Task("dotnet-buildtasks")
     .IsDependentOn("dotnet")
     .Does(() =>
     {
-        RunMSBuildWithDotNet($"{rootFolder}/Microsoft.Maui.BuildTasks.slnf");
+        var properties = new Dictionary<string, string>
+        {
+            ["BuildTaskOnlyBuild"] = "true"
+        };
+        RunMSBuildWithDotNet($"{rootFolder}/Microsoft.Maui.BuildTasks.slnf", properties);
     })
    .OnError(exception =>
     {
@@ -127,36 +131,9 @@ Task("dotnet-buildtasks")
         throw exception;
     });
 
-Task("android-aar")
-    .Does(() =>
-    {
-        var root = "./src/Core/AndroidNative/";
-
-        var gradlew = root + "gradlew";
-        if (IsRunningOnWindows())
-            gradlew += ".bat";
-
-        var exitCode = StartProcess(
-            MakeAbsolute((FilePath)gradlew),
-            new ProcessSettings
-            {
-                Arguments = $"createAar --rerun-tasks",
-                WorkingDirectory = root
-            });
-
-        if (exitCode != 0)
-        {
-            if (IsCIBuild() || IsTarget("android-aar"))
-                throw new Exception("Gradle failed to build maui.aar: " + exitCode);
-            else
-                Information("This task failing locally will not break local MAUI development. Gradle failed to build maui.aar: {0}", exitCode);
-        }
-    });
-
 Task("dotnet-build")
     .IsDependentOn("dotnet")
     .IsDependentOn("dotnet-buildtasks")
-    .IsDependentOn("android-aar")
     .Description("Build the solutions")
     .Does(() =>
     {
@@ -203,7 +180,7 @@ Task("dotnet-samples")
         }
         else
         {
-            projectsToBuild = "./Microsoft.Maui.Samples.slnf";
+            projectsToBuild = "./eng/Microsoft.Maui.Samples.slnf";
         }
 
         RunMSBuildWithDotNet(projectsToBuild, properties, binlogPrefix: "sample-");
@@ -295,7 +272,6 @@ Task("dotnet-test")
     });
 
 Task("dotnet-pack-maui")
-    .IsDependentOn("android-aar")
     .WithCriteria(RunPackTarget())
     .Does(() =>
     {
@@ -308,9 +284,11 @@ Task("dotnet-pack-maui")
             ReplaceTextInFiles(originalNuget, "LOCAL_PLACEHOLDER", nugetSource);
         }
 
-        var sln = "./Microsoft.Maui.Packages.slnf";
+        var sln = "./eng/Microsoft.Maui.Packages.slnf";
         if (!IsRunningOnWindows())
-            sln = "./Microsoft.Maui.Packages-mac.slnf";
+        {
+            sln = "./eng/Microsoft.Maui.Packages-mac.slnf";
+        }
  
         if(string.IsNullOrEmpty(officialBuildId))
         {
@@ -532,6 +510,48 @@ Task("VS")
     }); 
 
 
+Task("GenerateCgManifest")
+    .Description("Generates the cgmanifest.json file with versions from Versions.props")
+    .Does(() => 
+{
+    Information("Generating cgmanifest.json from Versions.props");
+    
+    // Use pwsh on all platforms
+    var pwshExecutable = "pwsh";
+    
+    // Check if pwsh is available
+    try {
+        if (IsRunningOnWindows()) {
+            var exitCode = StartProcess("where", new ProcessSettings {
+                Arguments = "pwsh",
+                RedirectStandardOutput = true, 
+                RedirectStandardError = true
+            });
+            if (exitCode != 0) {
+                Information("pwsh not found, falling back to powershell");
+                pwshExecutable = "powershell";
+            }
+        } else {
+            var exitCode = StartProcess("which", new ProcessSettings {
+                Arguments = "pwsh",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            });
+            if (exitCode != 0) {
+                throw new Exception("PowerShell Core (pwsh) is not installed. Please install it to continue.");
+            }
+        }
+    } catch (Exception ex) when (!IsRunningOnWindows()) {
+        Error("Error checking for pwsh: " + ex.Message);
+        throw new Exception("PowerShell Core (pwsh) is required on non-Windows platforms. Please install it and try again.");
+    }
+    
+    // Execute the PowerShell script
+    StartProcess(pwshExecutable, new ProcessSettings {
+        Arguments = "-NonInteractive -ExecutionPolicy Bypass -File ./eng/scripts/update-cgmanifest.ps1"
+    });
+});
+
 bool RunPackTarget()
 {
     // Is the user running the pack target explicitly?
@@ -614,7 +634,6 @@ void UseLocalNuGetCacheFolder(bool reset = false)
 
 void StartVisualStudioCodeForDotNet()
 {
-    string workspace = "./maui.code-workspace";
     if (IsCIBuild())
     {
         Error("This target should not run on CI.");
@@ -626,7 +645,7 @@ void StartVisualStudioCodeForDotNet()
         SetDotNetEnvironmentVariables();
     }
 
-    StartProcess("code", new ProcessSettings{ Arguments = workspace, EnvironmentVariables = GetDotNetEnvironmentVariables() });
+    StartProcess("code", new ProcessSettings{ EnvironmentVariables = GetDotNetEnvironmentVariables() });
 }
 
 void StartVisualStudioForDotNet()

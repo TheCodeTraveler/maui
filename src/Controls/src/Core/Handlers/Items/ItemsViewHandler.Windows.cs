@@ -58,6 +58,7 @@ namespace Microsoft.Maui.Controls.Handlers.Items
 		{
 			VirtualView.ScrollToRequested -= ScrollToRequested;
 			CleanUpCollectionViewSource(platformView);
+			_formsEmptyView?.Handler?.DisconnectHandler();
 			base.DisconnectHandler(platformView);
 		}
 
@@ -633,7 +634,7 @@ namespace Microsoft.Maui.Controls.Handlers.Items
 
 					// CollectionGroups property is of type IObservableVector, but these objects should implement ICollectionViewGroup
 					var itemGroup = CollectionViewSource.View.CollectionGroups[args.GroupIndex] as ICollectionViewGroup;
-					if (itemGroup != null && 
+					if (itemGroup != null &&
 						args.Index < itemGroup.GroupItems.Count)
 					{
 						return itemGroup.GroupItems[args.Index];
