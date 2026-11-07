@@ -29,6 +29,10 @@ schedules:
     - main
     - net*.0
     - inflight/current
+    exclude:
+    # Main owns .NET 11 development; older trains use their release branches.
+    - net10.0
+    - net11.0
   always: true
 
 variables:
@@ -45,11 +49,13 @@ parameters:
     demands:
       - ImageOverride -equals 1es-windows-2022
     os: windows
+# Hosted macOS does not yet provide Xcode 27; use the same image as PR builds.
 - name: MacOSPool
   type: object
   default:
-    name: Azure Pipelines
-    vmImage: macOS-15
+    name: AcesShared
+    demands:
+      - ImageOverride -equals $(AcesMacImageOverride)
     os: macOS
 
 resources:
@@ -65,6 +71,8 @@ extends:
   ${{ else }}:
     template: v1/1ES.Unofficial.PipelineTemplate.yml@1ESPipelineTemplates
   parameters:
+    settings:
+      networkIsolationPolicy: Permissive, CFSClean, CFSClean2
     pool: ${{ parameters.WindowsPool }}
     sdl:
       binskim:
@@ -102,6 +110,7 @@ extends:
             onlyAndroidPlatformDefaultApis: true
             skipAndroidEmulatorImages: true
             skipAndroidCreateAvds: true
+            skipSimulatorSetup: true
             skipProvisioning: true
             skipXcode: false
             base64Encode: true
@@ -112,6 +121,20 @@ extends:
         parameters:
           pool: ${{ parameters.WindowsPool }}
           dependsOnStage: Pack
+
+    # Localization with OneLocBuild. Only run on official builds for handoff branches.
+    - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+      - stage: Localization
+        displayName: Localization
+        dependsOn: []
+        condition: and(succeeded(), eq(variables.isLocHandoffBranch, true))
+        jobs:
+          - template: /eng/common/templates-official/job/onelocbuild.yml@self
+            parameters:
+              CeapexServiceConnection: dnceng-onelocbuild-ceapex
+              SkipLocProjectJsonGeneration: true
+              MirrorRepo: 'maui'
+              MirrorBranch: ${{ replace(variables['Build.SourceBranch'], 'refs/heads/', '') }}
 
     # Publish and validation steps. Only run in official builds
     - template: /eng/common/templates-official/post-build/post-build.yml@self
@@ -125,6 +148,3 @@ extends:
         - Pack
         publishDependsOn:
         - Validate
-        # This is to enable SDL runs part of Post-Build Validation Stage
-        SDLValidationParameters:
-          enable: false

@@ -14,6 +14,7 @@ using Microsoft.Maui.LifecycleEvents;
 using AAnimation = Android.Views.Animations.Animation;
 using AColor = Android.Graphics.Color;
 using AView = Android.Views.View;
+using AWindow = Android.Views.Window;
 
 namespace Microsoft.Maui.Controls.Platform
 {
@@ -91,7 +92,7 @@ namespace Microsoft.Maui.Controls.Platform
 				throw new InvalidOperationException("Root View Needs to be set");
 		}
 
-		Task<Page> PopModalPlatformAsync(bool animated)
+		async Task<Page> PopModalPlatformCoreAsync(bool animated)
 		{
 			Page modal = CurrentPlatformModalPage;
 			_platformModalPages.Remove(modal);
@@ -104,7 +105,14 @@ namespace Microsoft.Maui.Controls.Platform
 			// If for the dialog is null what we want to do?
 			if (dialogFragment is null)
 			{
-				return Task.FromResult(modal);
+				return modal;
+			}
+
+			// A deferred pop can arrive before the first layout starts the entrance animation.
+			// Wait for it so the entrance and exit animations cannot replace each other.
+			if (animated && dialogFragment.IsAnimated && dialogFragment.View is not null)
+			{
+				await dialogFragment.AnimationTask;
 			}
 
 			var source = new TaskCompletionSource<Page>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -119,11 +127,21 @@ namespace Microsoft.Maui.Controls.Platform
 			}
 			else
 			{
-				dialogFragment.Dismiss();
+				// When batch-dismissing modals (e.g., PopToRoot), use DismissNow() to
+				// remove the fragment synchronously. This prevents intermediate modals
+				// from briefly flashing on screen between sequential pops.
+				bool isBatchPopping = _window.Page is Shell shell
+					&& shell.CurrentItem?.CurrentItem?.IsPoppingModalStack == true;
+
+				if (isBatchPopping)
+					dialogFragment.DismissNow();
+				else
+					dialogFragment.Dismiss();
+
 				source.TrySetResult(modal);
 			}
 
-			return source.Task;
+			return await source.Task;
 
 			void OnAnimationEnded(object? sender, AAnimation.AnimationEndEventArgs e)
 			{
@@ -150,7 +168,7 @@ namespace Microsoft.Maui.Controls.Platform
 					throw new InvalidOperationException("Current Root View cannot be null");
 		}
 
-		async Task PushModalPlatformAsync(Page modal, bool animated)
+		async Task PushModalPlatformCoreAsync(Page modal, bool animated)
 		{
 			var viewToHide = GetCurrentRootView();
 
@@ -183,17 +201,7 @@ namespace Microsoft.Maui.Controls.Platform
 
 			if (animated)
 			{
-				TaskCompletionSource<bool> animationCompletionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-				dialogFragment.AnimationEnded += OnAnimationEnded;
-
-				void OnAnimationEnded(object? sender, EventArgs e)
-				{
-					dialogFragment.AnimationEnded -= OnAnimationEnded;
-					animationCompletionSource.SetResult(true);
-				}
-
-				await animationCompletionSource.Task;
+				await dialogFragment.AnimationTask;
 			}
 			else
 			{
@@ -218,10 +226,10 @@ namespace Microsoft.Maui.Controls.Platform
 			IMauiContext _mauiWindowContext;
 			NavigationRootManager? _navigationRootManager;
 			static readonly ColorDrawable TransparentColorDrawable = new(AColor.Transparent);
-			bool _pendingAnimation = true;
+			readonly TaskCompletionSource<bool> _animationCompletionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
 			bool _pendingNavigation = true;
 
-			internal event EventHandler? AnimationEnded;
+			internal Task AnimationTask => _animationCompletionSource.Task;
 			internal event EventHandler? PresentationCompleted;
 
 			public bool IsAnimated { get; internal set; }
@@ -251,7 +259,6 @@ namespace Microsoft.Maui.Controls.Platform
 					dialog.Window.SetSoftInputMode(attributes.SoftInputMode);
 				}
 
-				// Configure translucent system bars for modal pages on Android API 30+
 				if (OperatingSystem.IsAndroidVersionAtLeast(30) && Context?.GetActivity() is global::Android.App.Activity activity)
 				{
 					dialog.Window.ConfigureTranslucentSystemBars(activity);
@@ -267,8 +274,28 @@ namespace Microsoft.Maui.Controls.Platform
 #pragma warning restore CA1422
 				}
 
+				if (RuntimeFeature.UseMauiAndroidSystemBarBackgrounds && mainActivityWindow is not null)
+				{
+					CopySystemBarForegroundAppearance(mainActivityWindow, dialog.Window);
+				}
+
+				UpdateModalWindowChrome(dialog.Window, Context);
 
 				return dialog;
+			}
+
+			static void CopySystemBarForegroundAppearance(AWindow sourceWindow, AWindow targetWindow)
+			{
+				var sourceWindowInsetsController = WindowCompat.GetInsetsController(sourceWindow, sourceWindow.DecorView);
+				var targetWindowInsetsController = WindowCompat.GetInsetsController(targetWindow, targetWindow.DecorView);
+
+				if (sourceWindowInsetsController is null || targetWindowInsetsController is null)
+				{
+					return;
+				}
+
+				targetWindowInsetsController.AppearanceLightStatusBars = sourceWindowInsetsController.AppearanceLightStatusBars;
+				targetWindowInsetsController.AppearanceLightNavigationBars = sourceWindowInsetsController.AppearanceLightNavigationBars;
 			}
 
 			void OnPageHandlerChanged(object? sender, EventArgs e)
@@ -295,7 +322,8 @@ namespace Microsoft.Maui.Controls.Platform
 				}
 
 
-				if (e.IsOneOf(Page.BackgroundColorProperty, Page.BackgroundProperty))
+				if (e.IsOneOf(Page.BackgroundColorProperty, Page.BackgroundProperty) ||
+					IsNavigationPageBarProperty(e.PropertyName))
 				{
 					UpdateBackgroundColor();
 				}
@@ -313,9 +341,52 @@ namespace Microsoft.Maui.Controls.Platform
 				if (pageView is null)
 					return;
 
-				var modalBkgndColor = view.Background;
-				if (modalBkgndColor is null)
+				var modalBackground = view.Background;
+				if (modalBackground is null)
 					pageView.SetWindowBackground();
+
+				UpdateModalWindowChrome(Dialog?.Window, pageView.Context);
+			}
+
+			void UpdateModalWindowChrome(AWindow? window, Context? context)
+			{
+				var modalBackground = (_modal as IView)?.Background;
+
+				if (_modal is NavigationPage navigationPage)
+				{
+					AndroidSystemChrome.UpdateWindowChrome(
+						context ?? Context,
+						window,
+						updateStatusBar: true,
+						updateNavigationBar: true,
+						statusBarBackground: GetNavigationPageBarBackground(navigationPage),
+						navigationBarBackground: modalBackground);
+					return;
+				}
+
+				AndroidSystemChrome.UpdateWindowChrome(
+					context ?? Context,
+					window,
+					updateStatusBar: true,
+					updateNavigationBar: true,
+					background: modalBackground);
+			}
+
+			static bool IsNavigationPageBarProperty(string? propertyName)
+			{
+				return propertyName == NavigationPage.BarBackgroundColorProperty.PropertyName ||
+					propertyName == NavigationPage.BarBackgroundProperty.PropertyName ||
+					propertyName == NavigationPage.BarTextColorProperty.PropertyName;
+			}
+
+			static Brush? GetNavigationPageBarBackground(NavigationPage navigationPage)
+			{
+				if (navigationPage.BarBackground is not null)
+				{
+					return navigationPage.BarBackground;
+				}
+
+				return navigationPage.BarBackgroundColor is null ? null : new SolidColorBrush(navigationPage.BarBackgroundColor);
 			}
 
 			public override AView OnCreateView(LayoutInflater inflater, ViewGroup? container, Bundle? savedInstanceState)
@@ -324,7 +395,8 @@ namespace Microsoft.Maui.Controls.Platform
 					.MakeScoped(layoutInflater: inflater, fragmentManager: ChildFragmentManager, registerNewNavigationRoot: true);
 
 				_navigationRootManager = modalContext.GetNavigationRootManager();
-				_navigationRootManager.Connect(_modal, modalContext);
+				if (!_navigationRootManager.Connect(_modal, modalContext))
+					throw new InvalidOperationException("A modal navigation root must be initialized synchronously.");
 
 				UpdateBackgroundColor();
 
@@ -416,13 +488,7 @@ namespace Microsoft.Maui.Controls.Platform
 
 			void FireAnimationEnded()
 			{
-				if (!_pendingAnimation)
-				{
-					return;
-				}
-
-				_pendingAnimation = false;
-				AnimationEnded?.Invoke(this, EventArgs.Empty);
+				_animationCompletionSource.TrySetResult(true);
 			}
 
 			void FirePresentationCompleted()
@@ -495,6 +561,25 @@ namespace Microsoft.Maui.Controls.Platform
 					});
 
 					return handled || base.OnKeyUp(keyCode, e);
+				}
+
+				public override bool DispatchTouchEvent(MotionEvent? e)
+				{
+					if (e is null)
+					{
+						return false;
+					}
+
+					bool handled = base.DispatchTouchEvent(e);
+
+					// Modal dialogs have their own Android Window, so touch events don't
+					// reach the Activity's DispatchTouchEvent. Forward them to the MAUI
+					// Window so that HideSoftInputOnTappedChangedManager can detect taps
+					// and dismiss the keyboard when HideSoftInputOnTapped is enabled.
+					bool implHandled =
+						(Context.GetWindow() as IPlatformEventsListener)?.DispatchTouchEvent(e) == true;
+
+					return handled || implHandled;
 				}
 
 				sealed class CallBack : OnBackPressedCallback

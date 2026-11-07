@@ -5,9 +5,7 @@ using PlatformView = Microsoft.Maui.Platform.MauiSearchBar;
 using PlatformView = AndroidX.AppCompat.Widget.SearchView;
 #elif WINDOWS
 using PlatformView = Microsoft.UI.Xaml.Controls.AutoSuggestBox;
-#elif TIZEN
-using PlatformView = Microsoft.Maui.Platform.MauiSearchBar;
-#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID && !TIZEN)
+#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID)
 using PlatformView = System.Object;
 #endif
 
@@ -17,7 +15,7 @@ namespace Microsoft.Maui.Handlers
 	{
 		public static IPropertyMapper<ISearchBar, ISearchBarHandler> Mapper = new PropertyMapper<ISearchBar, ISearchBarHandler>(ViewHandler.ViewMapper)
 		{
-#if __IOS__
+#if __IOS__ || ANDROID
 			[nameof(ISearchBar.IsEnabled)] = MapIsEnabled,
 #endif
 			[nameof(ISearchBar.Background)] = MapBackground,
@@ -33,6 +31,8 @@ namespace Microsoft.Maui.Handlers
 			[nameof(ISearchBar.PlaceholderColor)] = MapPlaceholderColor,
 			[nameof(ISearchBar.Text)] = MapText,
 			[nameof(ISearchBar.TextColor)] = MapTextColor,
+			[nameof(ISearchBar.CursorPosition)] = MapCursorPosition,
+			[nameof(ISearchBar.SelectionLength)] = MapSelectionLength,
 			[nameof(ISearchBar.CancelButtonColor)] = MapCancelButtonColor,
 			[nameof(ISearchBar.SearchIconColor)] = MapSearchIconColor,
 			[nameof(ISearchBar.Keyboard)] = MapKeyboard,

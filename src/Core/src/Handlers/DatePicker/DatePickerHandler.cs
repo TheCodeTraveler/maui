@@ -6,9 +6,7 @@ using PlatformView = UIKit.UIDatePicker;
 using PlatformView = Microsoft.Maui.Platform.MauiDatePicker;
 #elif WINDOWS
 using PlatformView = Microsoft.UI.Xaml.Controls.CalendarDatePicker;
-#elif TIZEN
-using PlatformView = Tizen.UIExtensions.NUI.Entry;
-#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID && !TIZEN)
+#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID)
 using PlatformView = System.Object;
 #endif
 
@@ -25,6 +23,7 @@ namespace Microsoft.Maui.Handlers
 #if ANDROID || WINDOWS
 			[nameof(IDatePicker.Background)] = MapBackground,
 #elif IOS
+			[nameof(IDatePicker.Background)] = MapBackground,
 			[nameof(IDatePicker.FlowDirection)] = MapFlowDirection,
 #endif
 			[nameof(IDatePicker.CharacterSpacing)] = MapCharacterSpacing,
@@ -74,7 +73,7 @@ namespace Microsoft.Maui.Handlers
 		/// </summary>
 		/// <param name="handler">The associated handler.</param>
 		/// <param name="datePicker">The associated <see cref="IDatePicker"/> instance.</param>
-		public static partial void MapFlowDirection(DatePickerHandler handler, IDatePicker datePicker);
+		public static partial void MapFlowDirection(IDatePickerHandler handler, IDatePicker datePicker);
 #endif
 
 		/// <summary>

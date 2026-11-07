@@ -4,9 +4,7 @@ using PlatformView = Microsoft.Maui.Platform.MauiPicker;
 using PlatformView = Microsoft.Maui.Platform.MauiPicker;
 #elif WINDOWS
 using PlatformView = Microsoft.UI.Xaml.Controls.ComboBox;
-#elif TIZEN
-using PlatformView = Tizen.UIExtensions.NUI.Entry;
-#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID && !TIZEN)
+#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID)
 using PlatformView = System.Object;
 #endif
 
@@ -18,6 +16,9 @@ namespace Microsoft.Maui.Handlers
 		{
 #if __ANDROID__ || WINDOWS
 			[nameof(IPicker.Background)] = MapBackground,
+#endif
+#if __ANDROID__
+			[nameof(IView.IsEnabled)] = MapIsEnabled,
 #endif
 			[nameof(IPicker.CharacterSpacing)] = MapCharacterSpacing,
 			[nameof(IPicker.Font)] = MapFont,

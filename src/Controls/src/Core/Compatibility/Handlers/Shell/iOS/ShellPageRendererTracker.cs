@@ -3,10 +3,13 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.ComponentModel;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.Versioning;
 using System.Windows.Input;
 using CoreGraphics;
 using Foundation;
+using Microsoft.Maui.Controls.Diagnostics;
+using Microsoft.Maui.Controls.Internals;
 using Microsoft.Maui.Graphics;
 using Microsoft.Maui.Graphics.Platform;
 using UIKit;
@@ -79,6 +82,14 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 		SearchHandlerAppearanceTracker? _searchHandlerAppearanceTracker;
 		IFontManager _fontManager;
 		bool _isVisiblePage;
+		NSObject? _keyboardWillHideObserver;
+		bool _pendingKeyboardNavigation;
+		readonly List<ToolbarItem> _trackedToolbarItems = [];
+		bool _toolbarUpdatePending;
+		readonly NativeElementRegistrationSet _nativeLeftToolbarRegistrations = new NativeElementRegistrationSet();
+		readonly NativeElementRegistrationSet _nativeRightToolbarRegistrations = new NativeElementRegistrationSet();
+		readonly NativeElementRegistrationSet _nativeSearchRegistrations = new NativeElementRegistrationSet();
+		int _leftToolbarRegistrationGeneration;
 
 		BackButtonBehavior? BackButtonBehavior { get; set; }
 		UINavigationItem? NavigationItem { get; set; }
@@ -93,6 +104,8 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 			_context.Shell.PropertyChanged += HandleShellPropertyChanged;
 
 			_fontManager = context.Shell.RequireFontManager();
+
+			_keyboardWillHideObserver = UIKeyboard.Notifications.ObserveWillHide(OnKeyboardWillHide);
 		}
 
 		public void OnFlyoutBehaviorChanged(FlyoutBehavior behavior)
@@ -108,7 +121,10 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 			if (e.Is(VisualElement.FlowDirectionProperty))
 				UpdateFlowDirection();
 			else if (e.Is(Shell.FlyoutIconProperty) || e.Is(Shell.ForegroundColorProperty))
+			{
 				UpdateLeftToolbarItems();
+				UpdateRightBarButtonItemTintColors();
+			}
 		}
 
 #nullable disable
@@ -155,6 +171,7 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 			else if (e.PropertyName == Shell.ForegroundColorProperty.PropertyName)
 			{
 				UpdateLeftToolbarItems();
+				UpdateRightBarButtonItemTintColors();
 			}
 		}
 
@@ -192,12 +209,20 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 
 		protected virtual void UpdateTitle()
 		{
-			if (!ToolbarReady() || NavigationItem is null || _context?.Shell?.Toolbar is null)
+
+			if (NavigationItem is null)
 			{
 				return;
 			}
 
-			NavigationItem.Title = _context.Shell.Toolbar.Title;
+			if (ToolbarReady() && _context?.Shell?.Toolbar is not null)
+			{
+				NavigationItem.Title = _context.Shell.Toolbar.Title;
+				return;
+			}
+
+			// Update back-stack pages so iOS back button/history menu reflects title changes
+			NavigationItem.Title = Page?.Title;
 		}
 
 
@@ -230,8 +255,24 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 		protected virtual void OnPageSet(Page oldPage, Page newPage)
 #nullable restore
 		{
+			_leftToolbarRegistrationGeneration++;
+			_nativeLeftToolbarRegistrations.Clear();
+			_nativeRightToolbarRegistrations.Clear();
+			_nativeSearchRegistrations.Clear();
+
 			if (oldPage is not null)
 			{
+				CleanToolbarItems();
+
+				// The _tracker.Page assignment now occurs before the navigation animation,
+				// so oldPage.Disappearing is unsubscribed below before it fires — leaving
+				// _isVisiblePage stuck as true. Calling SetDisappeared() here resets it so
+				// SetAppeared() runs its full body for the incoming page. Skipped during
+				// Dispose (newPage is null) since _context is already cleared and cleanup
+				// is handled there. No-op in normal flows.
+				if (newPage is not null)
+					SetDisappeared();
+
 				oldPage.Appearing -= PageAppearing;
 				oldPage.Disappearing -= PageDisappearing;
 				oldPage.PropertyChanged -= OnPagePropertyChanged;
@@ -276,7 +317,7 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 				ViewController.AutomaticallyAdjustsScrollViewInsets = false;
 			}
 		}
-		
+
 		internal void UpdateTitleViewInternal()
 		{
 			UpdateTitleView();
@@ -354,6 +395,29 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 			return new TitleViewContainer(titleView);
 		}
 
+		/// <summary>
+		/// Re-applies the navigation bar frame to the current TitleView container.
+		/// On iOS 26+ the TitleView container uses autoresizing masks with an explicitly set frame
+		/// (see <see cref="CreateTitleViewContainer"/>), so the frame is not automatically recomputed
+		/// when the navigation bar resizes during rotation or window size changes. This explicitly
+		/// resizes the container to match the navigation bar's new dimensions.
+		/// </summary>
+		internal void UpdateTitleViewFrameForOrientation()
+		{
+			if (NavigationItem?.TitleView is not TitleViewContainer titleViewContainer)
+			{
+				return;
+			}
+
+			var navigationBarFrame = ViewController?.NavigationController?.NavigationBar.Frame;
+			if (navigationBarFrame.HasValue)
+			{
+				titleViewContainer.Frame = new CGRect(0, 0, navigationBarFrame.Value.Width, navigationBarFrame.Value.Height);
+				titleViewContainer.Height = navigationBarFrame.Value.Height;
+				titleViewContainer.LayoutIfNeeded();
+			}
+		}
+
 		void OnTitleViewParentSet(object? sender, EventArgs e)
 		{
 			if (sender is Element element)
@@ -384,6 +448,8 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 				return;
 			}
 
+			CleanToolbarItems();
+			_nativeRightToolbarRegistrations.Clear();
 			if (NavigationItem.RightBarButtonItems != null)
 			{
 				for (var i = 0; i < NavigationItem.RightBarButtonItems.Length; i++)
@@ -398,13 +464,27 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 			{
 				foreach (var item in System.Linq.Enumerable.OrderBy(Page.ToolbarItems, x => x.Priority))
 				{
+					TrackToolbarItem(item);
+
 					if (item.Order == ToolbarItemOrder.Secondary)
 					{
-						(secondaries ??= []).Add(item.ToSecondarySubToolbarItem().PlatformAction);
+						var secondaryItem = item.ToSecondarySubToolbarItem().PlatformAction;
+						(secondaries ??= []).Add(secondaryItem);
+						_nativeRightToolbarRegistrations.Register(
+							item,
+							secondaryItem,
+							NativeElementRoles.ToolbarOverflow,
+							NativeElementDiscriminators.LogicalModel);
 					}
 					else
 					{
-						(primaries ??= []).Add(item.ToUIBarButtonItem());
+						var primaryItem = item.ToUIBarButtonItem();
+						(primaries ??= []).Add(primaryItem);
+						_nativeRightToolbarRegistrations.Register(
+							item,
+							primaryItem,
+							NativeElementRoles.ToolbarItem,
+							NativeElementDiscriminators.LogicalModel);
 					}
 				}
 			}
@@ -412,13 +492,27 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 			{
 				foreach (var item in System.Linq.Enumerable.OrderBy(shellToolbarItems, x => x.Priority))
 				{
+					TrackToolbarItem(item);
+
 					if (item.Order == ToolbarItemOrder.Secondary)
 					{
-						(secondaries ??= []).Add(item.ToSecondarySubToolbarItem().PlatformAction);
+						var secondaryItem = item.ToSecondarySubToolbarItem().PlatformAction;
+						(secondaries ??= []).Add(secondaryItem);
+						_nativeRightToolbarRegistrations.Register(
+							item,
+							secondaryItem,
+							NativeElementRoles.ToolbarOverflow,
+							NativeElementDiscriminators.LogicalModel);
 					}
 					else
 					{
-						(primaries ??= []).Add(item.ToUIBarButtonItem());
+						var primaryItem = item.ToUIBarButtonItem();
+						(primaries ??= []).Add(primaryItem);
+						_nativeRightToolbarRegistrations.Register(
+							item,
+							primaryItem,
+							NativeElementRoles.ToolbarItem,
+							NativeElementDiscriminators.LogicalModel);
 					}
 				}
 			}
@@ -428,7 +522,9 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 				primaries.Reverse();
 			}
 
-			if (secondaries is not null && secondaries.Count > 0)
+			// UIBarButtonItem(UIImage, UIMenu) is only available on iOS/MacCatalyst 14.0+.
+			if (secondaries is not null && secondaries.Count > 0 &&
+				(OperatingSystem.IsIOSVersionAtLeast(14) || OperatingSystem.IsMacCatalystVersionAtLeast(14)))
 			{
 				UIImage? secondaryIcon = null;
 				if (ViewController?.ParentViewController is ShellSectionRenderer ssr)
@@ -442,7 +538,13 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 				}
 
 				var menu = UIMenu.Create(string.Empty, null, UIMenuIdentifier.Edit, UIMenuOptions.DisplayInline, secondaries.ToArray());
-				var menuButton = new UIBarButtonItem(secondaryIcon, menu)
+				var menuControl = UIButton.FromType(UIButtonType.System);
+				menuControl.SetImage(secondaryIcon, UIControlState.Normal);
+				menuControl.Menu = menu;
+				menuControl.ShowsMenuAsPrimaryAction = true;
+				menuControl.AccessibilityIdentifier = "SecondaryToolbarMenuButton";
+				menuControl.Frame = new CGRect(0, 0, 44, 44);
+				var menuButton = new UIBarButtonItem(menuControl)
 				{
 					AccessibilityIdentifier = "SecondaryToolbarMenuButton"
 				};
@@ -452,23 +554,107 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 				primaries ??= [];
 
 				primaries.Insert(0, menuButton);
+				_nativeRightToolbarRegistrations.Register(
+					Page,
+					menu,
+					NativeElementRoles.ToolbarOverflow,
+					NativeElementDiscriminators.LogicalModel);
+				_nativeRightToolbarRegistrations.Register(
+					Page,
+					menuControl,
+					NativeElementRoles.ToolbarOverflow,
+					NativeElementDiscriminators.RealizedView);
 			}
 
 			NavigationItem.SetRightBarButtonItems(primaries is null ? Array.Empty<UIBarButtonItem>() : primaries.ToArray(), false);
 
+			UpdateRightBarButtonItemTintColors();
 			UpdateLeftToolbarItems();
+		}
+
+		void TrackToolbarItem(ToolbarItem item)
+		{
+			item.PropertyChanged += OnToolbarItemPropertyChanged;
+			_trackedToolbarItems.Add(item);
+		}
+
+		void CleanToolbarItems()
+		{
+			foreach (var item in _trackedToolbarItems)
+				item.PropertyChanged -= OnToolbarItemPropertyChanged;
+
+			_trackedToolbarItems.Clear();
+		}
+
+		[UnconditionalSuppressMessage("Memory", "MEM0003", Justification = "ToolbarItem PropertyChanged subscriptions are removed before replacement and in Dispose.")]
+		void OnToolbarItemPropertyChanged(object? sender, PropertyChangedEventArgs e)
+		{
+			if (sender is not ToolbarItem { Order: ToolbarItemOrder.Secondary })
+				return;
+
+			if (e.PropertyName != MenuItem.IsEnabledProperty.PropertyName &&
+				e.PropertyName != MenuItem.TextProperty.PropertyName &&
+				e.PropertyName != MenuItem.IconImageSourceProperty.PropertyName)
+			{
+				return;
+			}
+
+			if (_toolbarUpdatePending)
+				return;
+
+			_toolbarUpdatePending = true;
+			ApplicationModel.MainThread.BeginInvokeOnMainThread(() =>
+			{
+				_toolbarUpdatePending = false;
+				if (!_disposed)
+					UpdateToolbarItemsInternal();
+			});
+		}
+
+		/// iOS 26+: LiquidGlass no longer inherits the foreground color from the navigation bar's TintColor.
+		/// Explicitly set TintColor on each right bar button item to ensure the Shell.ForegroundColor is applied.
+		void UpdateRightBarButtonItemTintColors()
+		{
+			if (!(OperatingSystem.IsIOSVersionAtLeast(26) || OperatingSystem.IsMacCatalystVersionAtLeast(26)))
+			{
+				return;
+			}
+
+			if (NavigationItem?.RightBarButtonItems is not { Length: > 0 } rightItems)
+			{
+				return;
+			}
+
+			var foregroundColor = _context?.Shell?.CurrentPage?.GetValue(Shell.ForegroundColorProperty) ??
+								_context?.Shell?.GetValue(Shell.ForegroundColorProperty);
+
+			var platformColor = foregroundColor is Graphics.Color shellForegroundColor
+				? shellForegroundColor.ToPlatform()
+				: null;
+
+			foreach (var item in rightItems)
+			{
+				item.TintColor = platformColor;
+				if (item.CustomView is UIView customView)
+					customView.TintColor = platformColor;
+			}
 		}
 
 		void UpdateLeftToolbarItems()
 		{
 			var shell = _context?.Shell;
 			var mauiContext = MauiContext;
+			var trackedPage = Page;
 
-			if (shell is null || NavigationItem is null || mauiContext is null)
+			if (shell is null || NavigationItem is null || mauiContext is null || trackedPage is null)
 			{
 				return;
 			}
 
+			var registrationGeneration = ++_leftToolbarRegistrationGeneration;
+			var trackedNavigationItem = NavigationItem;
+			var trackedViewController = ViewController;
+			var isRootPage = IsRootPage;
 			var behavior = BackButtonBehavior;
 
 			var image = behavior.GetPropertyIfSet<ImageSource?>(BackButtonBehavior.IconOverrideProperty, null);
@@ -494,8 +680,18 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 
 			image.LoadImage(mauiContext, result =>
 			{
-				if (ViewController is null)
+				if (_disposed ||
+					trackedViewController is null ||
+					registrationGeneration != _leftToolbarRegistrationGeneration ||
+					!ReferenceEquals(Page, trackedPage) ||
+					!ReferenceEquals(NavigationItem, trackedNavigationItem) ||
+					!ReferenceEquals(ViewController, trackedViewController))
+				{
+					result?.Dispose();
 					return;
+				}
+
+				_nativeLeftToolbarRegistrations.Clear();
 
 				UIImage? icon = null;
 
@@ -543,7 +739,7 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 				{
 					NavigationItem.LeftBarButtonItem =
 						new UIBarButtonItem(icon, UIBarButtonItemStyle.Plain, (s, e) => LeftBarButtonItemHandler(ViewController, IsRootPage)) { Enabled = enabled };
-						
+
 					// For iOS 26+, explicitly set the tint color on the bar button item
 					// because the navigation bar's tint color is not automatically inherited
 					if (OperatingSystem.IsIOSVersionAtLeast(26) || OperatingSystem.IsMacCatalystVersionAtLeast(26))
@@ -562,28 +758,55 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 
 				if (NavigationItem.LeftBarButtonItem != null)
 				{
+					var customAccessibilityLabel = behavior.GetPropertyIfSet<string?>(BackButtonBehavior.AccessibilityLabelProperty, null);
+					bool hasCustomLabel = !string.IsNullOrEmpty(customAccessibilityLabel);
+
 					if (String.IsNullOrWhiteSpace(image?.AutomationId))
 					{
 						if (IsRootPage)
 						{
 							NavigationItem.LeftBarButtonItem.AccessibilityIdentifier = "OK";
-							NavigationItem.LeftBarButtonItem.AccessibilityLabel = "Menu";
+							NavigationItem.LeftBarButtonItem.AccessibilityLabel = hasCustomLabel ? customAccessibilityLabel : "Menu";
 						}
 						else
+						{
 							NavigationItem.LeftBarButtonItem.AccessibilityIdentifier = "Back";
+							if (hasCustomLabel)
+							{
+								NavigationItem.LeftBarButtonItem.AccessibilityLabel = customAccessibilityLabel;
+							}
+							else
+							{
+								NavigationItem.LeftBarButtonItem.AccessibilityLabel = null;
+							}
+						}
 					}
 					else
 					{
 						NavigationItem.LeftBarButtonItem.AccessibilityIdentifier = image.AutomationId;
+						if (hasCustomLabel)
+						{
+							NavigationItem.LeftBarButtonItem.AccessibilityLabel = customAccessibilityLabel;
+						}
 					}
 
 					if (image != null)
 					{
 #pragma warning disable CS0618 // Type or member is obsolete
 						NavigationItem.LeftBarButtonItem.SetAccessibilityHint(image);
-						NavigationItem.LeftBarButtonItem.SetAccessibilityLabel(image);
+						if (!hasCustomLabel)
+						{
+							NavigationItem.LeftBarButtonItem.SetAccessibilityLabel(image);
+						}
 #pragma warning restore CS0618 // Type or member is obsolete
 					}
+
+					var isBackButton = !isRootPage || command is not null;
+					_nativeLeftToolbarRegistrations.Register(
+						isBackButton ? trackedPage : shell,
+						NavigationItem.LeftBarButtonItem,
+						isBackButton ? NativeElementRoles.BackButton : NativeElementRoles.ShellFlyoutToggle,
+						NativeElementDiscriminators.LogicalModel);
 				}
 			});
 
@@ -600,6 +823,7 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 
 			var behavior = BackButtonBehavior;
 			var text = behavior.GetPropertyIfSet<string?>(BackButtonBehavior.TextOverrideProperty, null);
+			var accessibilityLabel = behavior.GetPropertyIfSet<string?>(BackButtonBehavior.AccessibilityLabelProperty, null);
 
 			var navController = ViewController?.NavigationController;
 
@@ -616,13 +840,30 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 						var previousNavItem = viewControllers[count - 2].NavigationItem;
 						if (previousNavItem != null)
 						{
-							if (text is not null)
+							if (text is not null || !string.IsNullOrEmpty(accessibilityLabel))
 							{
 								var barButtonItem = (previousNavItem.BackBarButtonItem ??= new UIBarButtonItem());
-								barButtonItem.Title = text;
+								if (text is not null)
+								{
+									barButtonItem.Title = text;
+								}
+								else if (barButtonItem.Title is null)
+								{
+									// Preserve default back button title when only accessibility label is set
+									barButtonItem.Title = previousNavItem.Title;
+								}
+								if (!string.IsNullOrEmpty(accessibilityLabel))
+								{
+									barButtonItem.AccessibilityLabel = accessibilityLabel;
+								}
+								else
+								{
+									barButtonItem.AccessibilityLabel = null;
+								}
 							}
 							else if (previousNavItem.BackBarButtonItem != null)
 							{
+								previousNavItem.BackBarButtonItem.AccessibilityLabel = null;
 								previousNavItem.BackBarButtonItem = null;
 							}
 						}
@@ -651,7 +892,7 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 			}
 			else if (_flyoutBehavior == FlyoutBehavior.Flyout)
 			{
-				_context?.Shell?.SetValueFromRenderer(Shell.FlyoutIsPresentedProperty, true);
+				_context?.Shell?.SetValueFromRenderer(Shell.FlyoutIsPresentedProperty, BooleanBoxes.TrueBox);
 			}
 		}
 
@@ -709,13 +950,11 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 			if (BackButtonBehavior == value)
 				return;
 
-			if (BackButtonBehavior != null)
-				BackButtonBehavior.PropertyChanged -= OnBackButtonBehaviorPropertyChanged;
+			BackButtonBehavior?.PropertyChanged -= OnBackButtonBehaviorPropertyChanged;
 
 			BackButtonBehavior = value;
 
-			if (BackButtonBehavior != null)
-				BackButtonBehavior.PropertyChanged += OnBackButtonBehaviorPropertyChanged;
+			BackButtonBehavior?.PropertyChanged += OnBackButtonBehaviorPropertyChanged;
 
 			UpdateToolbarItemsInternal();
 		}
@@ -867,10 +1106,52 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 				UpdateSearchVisibility(_searchController);
 			else if (e.PropertyName == SearchHandler.IsSearchEnabledProperty.PropertyName)
 				UpdateSearchIsEnabled(_searchController);
+			else if (e.PropertyName == SearchHandler.ShowsResultsProperty.PropertyName)
+				RecreateSearchController();
 			else if (e.Is(SearchHandler.AutomationIdProperty))
 			{
 				UpdateAutomationId();
 			}
+			else if (e.PropertyName == SearchHandler.QueryIconProperty.PropertyName)
+			{
+				UpdateSearchBarIcon(_searchController.SearchBar, _searchHandler.QueryIcon, UISearchBarIcon.Search);
+			}
+			else if (e.PropertyName == SearchHandler.ClearIconProperty.PropertyName)
+			{
+				UpdateSearchBarIcon(_searchController.SearchBar, _searchHandler.ClearIcon, UISearchBarIcon.Clear);
+			}
+			else if (e.PropertyName == SearchHandler.ClearPlaceholderIconProperty.PropertyName)
+			{
+				UpdateSearchBarIcon(_searchController.SearchBar, _searchHandler.ClearPlaceholderIcon, UISearchBarIcon.Bookmark);
+			}
+		}
+
+		void RecreateSearchController()
+		{
+			if (_searchHandler is null || NavigationItem is null)
+				return;
+
+			var query = _searchController?.SearchBar.Text;
+			var oldSearchController = _searchController;
+
+			DettachSearchController();
+			DisposeResultsRenderer();
+			oldSearchController?.Dispose();
+
+			AttachSearchController();
+
+			if (_searchController is not null && query is not null)
+				_searchController.SearchBar.Text = query;
+		}
+
+		void DisposeResultsRenderer()
+		{
+			if (_resultsRenderer is null)
+				return;
+
+			_resultsRenderer.ItemSelected -= OnSearchItemSelected;
+			_resultsRenderer.Dispose();
+			_resultsRenderer = null;
 		}
 
 		void UpdateAutomationId()
@@ -971,6 +1252,7 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 			}
 
 			_searchController = new UISearchController(_resultsRenderer?.ViewController);
+
 			var visibility = SearchHandler.SearchBoxVisibility;
 			if (visibility != SearchBoxVisibility.Hidden)
 			{
@@ -981,6 +1263,11 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 			}
 
 			var searchBar = _searchController.SearchBar;
+			_nativeSearchRegistrations.RegisterExclusive(
+				SearchHandler,
+				searchBar,
+				NativeElementRoles.SearchHandler,
+				NativeElementDiscriminators.RealizedView);
 
 			_searchController.SetSearchResultsUpdater(sc =>
 			{
@@ -991,6 +1278,7 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 			searchBar.OnEditingStopped += OnSearchBarEditingStopped;
 
 			searchBar.Placeholder = SearchHandler.Placeholder;
+			searchBar.Text = SearchHandler.Query;
 			UpdateSearchIsEnabled(_searchController);
 			searchBar.SearchButtonClicked += SearchButtonClicked;
 			if (OperatingSystem.IsIOSVersionAtLeast(11))
@@ -1024,10 +1312,7 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 
 		void OnSearchBarEditingStopped(object? sender, EventArgs e)
 		{
-			if (_searchController is not null)
-			{
-				_searchController.Active = false;
-			}
+			_searchController?.Active = false;
 		}
 
 		void BookmarkButtonClicked(object? sender, EventArgs e)
@@ -1037,6 +1322,7 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 
 		void DettachSearchController()
 		{
+			_nativeSearchRegistrations.Clear();
 
 			_searchHandlerAppearanceTracker?.Dispose();
 			_searchHandlerAppearanceTracker = null;
@@ -1065,12 +1351,63 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 		void OnSearchItemSelected(object? sender, object e)
 		{
 			if (_searchController is null)
-			{
 				return;
+
+			var searchController = _searchController;
+			var handlerController = SearchHandler as ISearchHandlerController;
+
+			// Dismiss the search controller first, then navigate after it is fully gone.
+			// UIKit rejects PushViewController calls while a modal presentation is occurring
+			// (including an active UISearchController). Using DidDismissSearchController ensures
+			// the push is not attempted until the dismissal animation is complete.
+			if (searchController.Active)
+			{
+				var previousDelegate = searchController.Delegate;
+				searchController.Delegate = new SearchItemSelectedDelegate(() =>
+				{
+					handlerController?.ItemSelected(e);
+				}, previousDelegate);
+				searchController.Active = false;
+			}
+			else
+			{
+				// Already dismissed — fire ItemSelected directly.
+				handlerController?.ItemSelected(e);
+			}
+		}
+
+		// One-shot UISearchControllerDelegate that fires ItemSelected after dismissal completes,
+		// then restores whatever delegate (if any) was previously installed on the search
+		// controller, so this temporary hookup doesn't permanently clobber other delegate behavior.
+		sealed class SearchItemSelectedDelegate : UISearchControllerDelegate
+		{
+			[UnconditionalSuppressMessage("Memory", "MEM0002", Justification = "The callback is retained only until the one-shot delegate handles search dismissal.")]
+			readonly Action _onDismissed;
+			[UnconditionalSuppressMessage("Memory", "MEM0002", Justification = "The previous delegate is retained only until it is restored after search dismissal.")]
+			readonly IUISearchControllerDelegate? _previousDelegate;
+			bool _fired;
+
+			internal SearchItemSelectedDelegate(Action onDismissed, IUISearchControllerDelegate? previousDelegate)
+			{
+				_onDismissed = onDismissed;
+				_previousDelegate = previousDelegate;
 			}
 
-			(SearchHandler as ISearchHandlerController)?.ItemSelected(e);
-			_searchController.Active = false;
+			public override void DidDismissSearchController(UISearchController searchController)
+			{
+				if (_fired)
+				{
+					return;
+				}
+				_fired = true;
+
+				if (searchController.Delegate == this)
+				{
+					searchController.Delegate = _previousDelegate!;
+				}
+
+				_onDismissed();
+			}
 		}
 
 		void SearchButtonClicked(object? sender, EventArgs e)
@@ -1098,11 +1435,60 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 				if (result != null)
 				{
 					var newResult = result.ImageWithRenderingMode(UIImageRenderingMode.AlwaysTemplate);
-					searchBar.SetImageforSearchBarIcon(newResult, icon, UIControlState.Normal);
-					searchBar.SetImageforSearchBarIcon(newResult, icon, UIControlState.Highlighted);
-					searchBar.SetImageforSearchBarIcon(newResult, icon, UIControlState.Selected);
+					searchBar.SetImageForSearchBarIcon(newResult, icon, UIControlState.Normal);
+					searchBar.SetImageForSearchBarIcon(newResult, icon, UIControlState.Highlighted);
+					searchBar.SetImageForSearchBarIcon(newResult, icon, UIControlState.Selected);
+
+					// iOS caches the clear button image once it has been shown. After the button
+					// has appeared (user typed text), SetImageForSearchBarIcon alone won't refresh
+					// it. Directly update the button subview so dynamic changes are reflected.
+					if (icon is UISearchBarIcon.Clear)
+					{
+						UpdateClearButtonImage(searchBar, newResult);
+					}
 				}
 			});
+		}
+
+		// Directly updates the clear button (X) inside UISearchBar's UITextField subview.
+		// This is required because iOS does not re-apply SetImageForSearchBarIcon to a
+		// clear button that is already visible on screen.
+		//
+		// NOTE: "searchField" and "clearButton" are private UIKit KVC keys. Apple does not
+		// expose these as public API. They have been stable across iOS versions and are a
+		// well-established pattern in Xamarin/MAUI, but could break in a future OS release.
+		static void UpdateClearButtonImage(UISearchBar searchBar, UIImage? image)
+		{
+			if (searchBar.ValueForKey(new NSString("searchField")) is UITextField textField &&
+				textField.ValueForKey(new NSString("clearButton")) is UIButton clearButton)
+			{
+				clearButton.SetImage(image, UIControlState.Normal);
+				clearButton.SetImage(image, UIControlState.Highlighted);
+			}
+		}
+
+		void UpdateSearchBarIcon(UISearchBar searchBar, ImageSource? source, UISearchBarIcon icon)
+		{
+			if (source is not null)
+			{
+				SetSearchBarIcon(searchBar, source, icon);
+			}
+			else
+			{
+				// Reset to default system icon by clearing the custom image
+				searchBar.SetImageForSearchBarIcon(null, icon, UIControlState.Normal);
+				searchBar.SetImageForSearchBarIcon(null, icon, UIControlState.Highlighted);
+				searchBar.SetImageForSearchBarIcon(null, icon, UIControlState.Selected);
+
+				if (icon is UISearchBarIcon.Clear)
+				{
+					// UIKit caches the clear button image once it is on-screen, so
+					// SetImageForSearchBarIcon(null, ...) alone will not update the visible
+					// button. Restore the system default SF Symbol so the button shows the
+					// standard 'X' instead of becoming imageless.
+					UpdateClearButtonImage(searchBar, UIImage.GetSystemImage("multiply.circle.fill"));
+				}
+			}
 		}
 
 		void OnPageLoaded(object? sender, EventArgs e)
@@ -1118,6 +1504,9 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 				SetDisappeared();
 				return;
 			}
+
+			// Set flag when page is loaded during navigation - this is when the keyboard issue can occur
+			_pendingKeyboardNavigation = true;
 
 			UpdateToolbarItemsInternal();
 
@@ -1175,6 +1564,77 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 				_context.Shell.Toolbar.PropertyChanged -= OnToolbarPropertyChanged;
 		}
 
+		void OnKeyboardWillHide(object? sender, UIKeyboardEventArgs e)
+		{
+			// Keyboard dismissal during page load can cause iOS to misposition the view behind the navigation bar.
+			// Detect and correct this by repositioning the view below the navigation bar when needed.
+
+			if (_disposed || ViewController?.View is null || ViewController.NavigationController is null)
+				return;
+
+			// Only apply fix during the problematic timing window (page load with navigation)
+			if (!_pendingKeyboardNavigation)
+				return;
+
+			var navController = ViewController.NavigationController;
+
+			// The keyboard observer is global — every live tracker receives every UIKeyboard hide
+			// event. If a modal view controller is currently presented over this nav controller,
+			// the keyboard belongs to that modal (e.g. a transparent Shell page with an Entry
+			// presented via Shell.GoToAsync). Return WITHOUT consuming _pendingKeyboardNavigation:
+			// this modal is transient, and the flag must remain armed for a genuine keyboard hide
+			// on this tracker after the modal is dismissed. The correction gate below
+			// (currentFrame.Y == 0 and related checks) is what prevents false positives.
+			if (navController.PresentedViewController is not null)
+				return;
+
+			var navBar = navController.NavigationBar;
+
+			if (navBar.Hidden || navBar.Frame.Height <= 0)
+			{
+				// No nav bar means the misposition scenario cannot occur; consume the flag so a
+				// later unrelated keyboard hide does not re-trigger this correction.
+				_pendingKeyboardNavigation = false;
+				return;
+			}
+
+			// Don't interfere with SearchHandler's keyboard management when it's active.
+			// Consume the flag here too — leaving it armed risks running the fix on a later,
+			// unrelated keyboard dismissal.
+			if (_searchController?.Active == true)
+			{
+				_pendingKeyboardNavigation = false;
+				return;
+			}
+
+			var currentFrame = ViewController.View.Frame;
+
+			// Skip frame adjustment for transparent Shell nav bar where Y=0 is intentional (content extends behind bar).
+			if (navBar.Translucent && currentFrame.Y == 0)
+				return;
+
+			var navBarBottom = navBar.Frame.Bottom;
+
+			if (currentFrame.Y == 0 && navBarBottom > 0 &&
+				navController.ViewControllers?.Length > 1 &&
+				ViewController == navController.TopViewController)
+			{
+				// Adjust height to fit available space after Y position change
+				var yOffset = navBarBottom - currentFrame.Y;
+				var correctFrame = new CGRect(
+					currentFrame.X,
+					navBarBottom,
+					currentFrame.Width,
+					currentFrame.Height - yOffset
+				);
+
+				ViewController.View.Frame = correctFrame;
+			}
+
+			// Clear flag after handling keyboard dismissal once
+			_pendingKeyboardNavigation = false;
+		}
+
 		#endregion SearchHandler
 
 		#region IDisposable Support
@@ -1193,6 +1653,11 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 
 			if (disposing)
 			{
+				CleanToolbarItems();
+				_leftToolbarRegistrationGeneration++;
+				_nativeLeftToolbarRegistrations.Clear();
+				_nativeRightToolbarRegistrations.Clear();
+				_nativeSearchRegistrations.Clear();
 				_searchHandlerAppearanceTracker?.Dispose();
 
 				if (Page is not null)
@@ -1210,17 +1675,26 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 				{
 					((IShellController)shell).RemoveFlyoutBehaviorObserver(this);
 
-					if (BackButtonBehavior is not null)
-						BackButtonBehavior.PropertyChanged -= OnBackButtonBehaviorPropertyChanged;
+					BackButtonBehavior?.PropertyChanged -= OnBackButtonBehaviorPropertyChanged;
 
 					shell.PropertyChanged -= HandleShellPropertyChanged;
 
-					if (shell.Toolbar is not null)
-						shell.Toolbar.PropertyChanged -= OnToolbarPropertyChanged;
+					shell.Toolbar?.PropertyChanged -= OnToolbarPropertyChanged;
 				}
 
 				if (NavigationItem?.TitleView is TitleViewContainer tvc)
+				{
+					// Explicitly null out the native TitleView to break the UIKit reference chain
+					// that prevents the page from being garbage collected when x:Name is used
+					// together with Shell.TitleView. The NameScope attached to the TitleView
+					// children holds a reference back to the page (via the registered x:Name),
+					// so clearing this native reference is necessary to allow GC.
+					NavigationItem.TitleView = null;
 					tvc.Disconnect();
+				}
+
+				_keyboardWillHideObserver?.Dispose();
+				_keyboardWillHideObserver = null;
 			}
 
 			_context = null;

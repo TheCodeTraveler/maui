@@ -165,18 +165,18 @@ if %IS_PACKAGED%==1 (
     
     echo Found MSIX: !MSIX_FILE!
     
-    REM Install dependencies
-    echo Installing dependencies...
-    for /f "delims=" %%f in ('dir /s /b "%SCENARIO_DIR%\*.msix" 2^>nul ^| findstr /i "Dependencies" ^| findstr /i "x64"') do (
-        echo Installing dependency: %%f
-        powershell -Command "Add-AppxPackage -Path '%%f'" 2>nul
-    )
-    
-    REM Install the app
-    echo Installing app package...
-    powershell -Command "Add-AppxPackage -Path '!MSIX_FILE!'"
+    REM Select dependency architecture by directory, not the x64 parent package name.
+    REM Disposable Helix workers may have apps holding shared runtime dependencies open.
+    echo Installing app package and x64 dependencies...
+    powershell -NoProfile -Command ^
+        "$ErrorActionPreference = 'Stop';" ^
+        "$dependencies = @(Get-ChildItem -Path '%SCENARIO_DIR%' -Filter '*.msix' -Recurse | Where-Object { $_.Directory.Name -eq 'x64' -and $_.Directory.Parent.Name -eq 'Dependencies' } | ForEach-Object FullName);" ^
+        "$installParameters = @{ Path = '!MSIX_FILE!'; ForceApplicationShutdown = $true };" ^
+        "if ($dependencies.Count -gt 0) { $installParameters.DependencyPath = $dependencies; $dependencies | ForEach-Object { Write-Host \"Dependency: $_\" } };" ^
+        "Add-AppxPackage @installParameters"
     if !ERRORLEVEL! NEQ 0 (
         echo ERROR: Failed to install app package
+        powershell -NoProfile -Command "Get-AppPackageLog -All | Select-Object -Last 50 | Format-List"
         exit /b 1
     )
     
@@ -204,16 +204,28 @@ if %IS_PACKAGED%==1 (
         echo App URI: !APP_URI!
         echo Test results file: %TEST_RESULTS_FILE%
         echo Category file path: %CATEGORY_FILE%
-        powershell -Command "Start-Process '!APP_URI!' -ArgumentList '\"%TEST_RESULTS_FILE%\"', '-1'"
+        call :launch_packaged "%PACKAGE_ID%" "%TEST_RESULTS_FILE%" -1
+        if !ERRORLEVEL! NEQ 0 (
+            echo ERROR: Packaged app launcher failed during category discovery ^(exit !ERRORLEVEL!^)
+            call :dump_diagnostics
+            set EXIT_CODE=1
+        )
         
-        set DO_CONTROLS_WAIT=1
+        set RUN_CATEGORIES_NEXT=1
     ) else (
         REM Single test run for non-Controls projects
         echo Starting app for single test run...
-        powershell -Command "Start-Process '!APP_URI!' -ArgumentList '\"%TEST_RESULTS_FILE%\"'"
-        
-        call :wait_for_result "%TEST_RESULTS_FILE%" "All Tests"
-        set DO_CONTROLS_WAIT=
+        call :launch_packaged "%PACKAGE_ID%" "%TEST_RESULTS_FILE%"
+        set LAUNCH_EXIT=!ERRORLEVEL!
+        if !LAUNCH_EXIT! NEQ 0 (
+            echo ERROR: Packaged app launcher exited with code !LAUNCH_EXIT!
+            call :dump_diagnostics
+            set EXIT_CODE=1
+        ) else if not exist "%TEST_RESULTS_FILE%" (
+            echo ERROR: Test results file was not created: %TEST_RESULTS_FILE%
+            call :dump_diagnostics
+            set EXIT_CODE=1
+        )
     )
     
     REM Set flag so we can jump to wait loop after exiting the if block
@@ -288,6 +300,7 @@ if %IS_PACKAGED%==1 (
             echo ERROR: Test categories file was not created during discovery phase
             echo Checking if exe directory has the file...
             dir "!EXE_DIR!\*.txt" 2>nul
+            call :dump_diagnostics
             set EXIT_CODE=1
             set SKIP_TO_RESULTS=1
         )
@@ -306,8 +319,20 @@ if %IS_PACKAGED%==1 (
             
             echo Running category !CATEGORY_INDEX!: !CATEGORY_NAME!
             start "" /wait "!TEST_EXE!" "%TEST_RESULTS_FILE%" !CATEGORY_INDEX!
+            set LAUNCH_ERRORLEVEL=!ERRORLEVEL!
+            echo App exited with code: !LAUNCH_ERRORLEVEL!
+            REM WinUI Application.Exit may return -1 on a successful run.
+            if !LAUNCH_ERRORLEVEL! NEQ 0 if !LAUNCH_ERRORLEVEL! NEQ -1 (
+                echo ERROR: Test process crashed for !CATEGORY_NAME! ^(exit !LAUNCH_ERRORLEVEL!^)
+                call :dump_diagnostics
+                set EXIT_CODE=1
+            )
             
-            call :wait_for_result "!EXPECTED_RESULT_FILE!" "!CATEGORY_NAME!"
+            if not exist "!EXPECTED_RESULT_FILE!" (
+                echo ERROR: Result file not produced for !CATEGORY_NAME!: !EXPECTED_RESULT_FILE!
+                call :dump_diagnostics
+                set EXIT_CODE=1
+            )
             
             set /a CATEGORY_INDEX+=1
         )
@@ -318,69 +343,37 @@ if %IS_PACKAGED%==1 (
         start "" /wait "!TEST_EXE!" "%TEST_RESULTS_FILE%"
         set LAUNCH_ERRORLEVEL=!ERRORLEVEL!
         echo App exited with code: !LAUNCH_ERRORLEVEL!
+        if !LAUNCH_ERRORLEVEL! NEQ 0 if !LAUNCH_ERRORLEVEL! NEQ -1 (
+            echo ERROR: Test process crashed ^(exit !LAUNCH_ERRORLEVEL!^)
+            call :dump_diagnostics
+            set EXIT_CODE=1
+        )
         
-        call :wait_for_result "%TEST_RESULTS_FILE%" "All Tests"
+        if not exist "%TEST_RESULTS_FILE%" (
+            echo ERROR: Test results file was not created: %TEST_RESULTS_FILE%
+            call :dump_diagnostics
+            set EXIT_CODE=1
+        )
     )
     
     popd
 )
 
 REM ========================================
-REM Jump to wait_for_categories if this is a packaged Controls test
+REM Run categories if this is a packaged Controls test
 REM (Must be outside the if block to avoid "... was unexpected" cmd.exe error)
 REM ========================================
-if defined DO_CONTROLS_WAIT goto :wait_for_categories
-goto :results
-
-:wait_for_categories
-REM ========================================
-REM Wait for Category Discovery (Packaged Controls Tests)
-REM ========================================
-echo Waiting for category discovery (timeout: 60 seconds)...
-
-set WAIT_COUNT=0
-:wait_for_categories_loop
-set /a WAIT_COUNT+=1
-timeout /t 10 /nobreak >nul
-
-if exist "%CATEGORY_FILE%" (
-    echo Category file found after %WAIT_COUNT%0 seconds
+if defined RUN_CATEGORIES_NEXT (
+    if not exist "%CATEGORY_FILE%" (
+        echo ERROR: Test categories file was not created during discovery phase
+        echo Expected location: %CATEGORY_FILE%
+        call :dump_diagnostics
+        set EXIT_CODE=1
+        goto :results
+    )
     goto :run_categories
 )
-
-echo Category file not found after %WAIT_COUNT%0 seconds...
-
-REM Check if the app process is still running
-powershell -Command "$processes = Get-Process | Where-Object { $_.ProcessName -like '*Controls.DeviceTests*' -or $_.ProcessName -like '*devicetests*' -or $_.ProcessName -like '*maui*' }; if ($processes) { $processes | Select-Object ProcessName, Id, StartTime, MainWindowTitle | Format-Table } else { Write-Host 'No matching app process found' }"
-
-if %WAIT_COUNT% LSS 6 goto :wait_for_categories_loop
-
-REM After 60 seconds, gather diagnostics
-echo Files in test results directory:
-dir "%TEST_RESULTS_DIR%" 2>nul
-
-REM Check if any files were created in the upload directory
-echo Files in upload root directory:
-dir "%UPLOAD_ROOT%" 2>nul
-
-REM Check Windows Event Log for crashes
-echo Checking Windows Event Log for application crashes...
-powershell -Command "Get-WinEvent -FilterHashtable @{LogName='Application';Level=2;StartTime=(Get-Date).AddMinutes(-5)} -MaxEvents 10 -ErrorAction SilentlyContinue | Select-Object TimeCreated, ProviderName, Message | Format-List"
-
-REM Check Windows Event Log for any MAUI-related errors
-echo Checking Windows Event Log for any .NET errors...
-powershell -Command "Get-WinEvent -FilterHashtable @{LogName='Application';StartTime=(Get-Date).AddMinutes(-5)} -MaxEvents 20 -ErrorAction SilentlyContinue | Where-Object { $_.Message -like '*MAUI*' -or $_.Message -like '*devicetest*' -or $_.Message -like '*.NET*' -or $_.ProviderName -like '*.NET*' } | Select-Object TimeCreated, ProviderName, Message | Format-List"
-
-REM List all running processes to help debug
-echo All running UWP/packaged app processes:
-powershell -Command "Get-Process | Where-Object { $_.MainWindowTitle -ne '' } | Select-Object ProcessName, Id, MainWindowTitle | Format-Table"
-
-if not exist "%CATEGORY_FILE%" (
-    echo ERROR: Test categories file was not created during discovery phase
-    echo Expected location: %CATEGORY_FILE%
-    set EXIT_CODE=1
-    goto :results
-)
+goto :results
 
 :run_categories
 REM ========================================
@@ -395,15 +388,33 @@ for /f "usebackq delims=" %%c in ("%CATEGORY_FILE%") do (
     if defined CATEGORY_FILTER (
         if /i "!CATEGORY_NAME!"=="%CATEGORY_FILTER%" (
             echo Running filtered category !CATEGORY_INDEX!: !CATEGORY_NAME!
-            powershell -Command "Start-Process '!APP_URI!' -ArgumentList '\"%TEST_RESULTS_FILE%\"', '!CATEGORY_INDEX!'"
-            call :wait_for_result "!EXPECTED_RESULT_FILE!" "!CATEGORY_NAME!"
+            call :launch_packaged "%PACKAGE_ID%" "%TEST_RESULTS_FILE%" !CATEGORY_INDEX!
+            set LAUNCH_EXIT=!ERRORLEVEL!
+            if !LAUNCH_EXIT! NEQ 0 (
+                echo ERROR: Packaged app launcher exited with code !LAUNCH_EXIT! for !CATEGORY_NAME!
+                call :dump_diagnostics
+                set EXIT_CODE=1
+            ) else if not exist "!EXPECTED_RESULT_FILE!" (
+                echo ERROR: Result file not produced for !CATEGORY_NAME!: !EXPECTED_RESULT_FILE!
+                call :dump_diagnostics
+                set EXIT_CODE=1
+            )
         ) else (
             echo Skipping category !CATEGORY_INDEX!: !CATEGORY_NAME! ^(filter: %CATEGORY_FILTER%^)
         )
     ) else (
         echo Running category !CATEGORY_INDEX!: !CATEGORY_NAME!
-        powershell -Command "Start-Process '!APP_URI!' -ArgumentList '\"%TEST_RESULTS_FILE%\"', '!CATEGORY_INDEX!'"
-        call :wait_for_result "!EXPECTED_RESULT_FILE!" "!CATEGORY_NAME!"
+        call :launch_packaged "%PACKAGE_ID%" "%TEST_RESULTS_FILE%" !CATEGORY_INDEX!
+        set LAUNCH_EXIT=!ERRORLEVEL!
+        if !LAUNCH_EXIT! NEQ 0 (
+            echo ERROR: Packaged app launcher exited with code !LAUNCH_EXIT! for !CATEGORY_NAME!
+            call :dump_diagnostics
+            set EXIT_CODE=1
+        ) else if not exist "!EXPECTED_RESULT_FILE!" (
+            echo ERROR: Result file not produced for !CATEGORY_NAME!: !EXPECTED_RESULT_FILE!
+            call :dump_diagnostics
+            set EXIT_CODE=1
+        )
     )
     
     set /a CATEGORY_INDEX+=1
@@ -437,33 +448,33 @@ echo Found %RESULT_COUNT% test result file(s)
 REM Merge results into testResults.xml for Helix
 echo Merging test results for Helix...
 powershell -Command ^
+    "$ErrorActionPreference = 'Stop';" ^
+    "$hasFailures = $false;" ^
     "$resultFiles = Get-ChildItem -Path '%TEST_RESULTS_DIR%' -Filter 'TestResults-*.xml';" ^
+    "$readerSettings = New-Object System.Xml.XmlReaderSettings;" ^
+    "$readerSettings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit;" ^
+    "$readerSettings.XmlResolver = $null;" ^
     "$mergedDoc = New-Object System.Xml.XmlDocument;" ^
     "$assembliesNode = $mergedDoc.CreateElement('assemblies');" ^
     "$mergedDoc.AppendChild($assembliesNode) | Out-Null;" ^
     "foreach ($file in $resultFiles) {" ^
     "    try {" ^
     "        $doc = New-Object System.Xml.XmlDocument;" ^
-    "        $doc.Load($file.FullName);" ^
-    "        $nodes = $doc.SelectNodes('//assembly');" ^
+    "        $reader = [System.Xml.XmlReader]::Create($file.FullName, $readerSettings);" ^
+    "        try { $doc.Load($reader) } finally { $reader.Dispose() };" ^
+    "        $nodes = $doc.SelectNodes('/assemblies/assembly');" ^
+    "        if ($nodes.Count -eq 0) { throw 'No xUnit assemblies found' };" ^
+    "        if ($doc.SelectSingleNode('/assemblies/assembly[@failed > 0 or @errors > 0]')) { Write-Host \"ERROR: Test failures in $($file.Name)\"; $hasFailures = $true };" ^
     "        foreach ($node in $nodes) {" ^
     "            $imported = $mergedDoc.ImportNode($node, $true);" ^
     "            $assembliesNode.AppendChild($imported) | Out-Null;" ^
     "        }" ^
-    "    } catch { Write-Host \"WARNING: Failed to parse $($file.Name): $_\" }" ^
+    "    } catch { Write-Host \"ERROR: Failed to parse $($file.Name): $_\"; $hasFailures = $true }" ^
     "}" ^
     "$mergedDoc.Save('%TEST_RESULTS_DIR%\testResults.xml');" ^
-    "Write-Host 'Created merged testResults.xml'"
-
-REM Check for test failures in result files
-for %%f in ("%TEST_RESULTS_DIR%\TestResults-*.xml") do (
-    powershell -Command ^
-        "$doc = New-Object System.Xml.XmlDocument;" ^
-        "$doc.Load('%%f');" ^
-        "$failed = $doc.SelectSingleNode('/assemblies/assembly[@failed > 0 or @errors > 0]/@failed');" ^
-        "if ($failed) { Write-Host 'ERROR: At least' $failed.Value 'test(s) failed in %%~nxf'; exit 1 }"
-    if !ERRORLEVEL! NEQ 0 set EXIT_CODE=1
-)
+    "Write-Host 'Created merged testResults.xml';" ^
+    "if ($hasFailures) { exit 1 }"
+if %ERRORLEVEL% NEQ 0 set EXIT_CODE=1
 
 :upload
 REM ========================================
@@ -483,39 +494,49 @@ echo ========================================
 
 exit /b %EXIT_CODE%
 
+:dump_diagnostics
 REM ========================================
-REM Subroutine: Wait for test result file
+REM Subroutine: Gather diagnostics
 REM ========================================
-:wait_for_result
-set WAIT_FILE=%~1
-set WAIT_CATEGORY=%~2
-set WAIT_SECONDS=0
+echo Files in test results directory:
+dir "%TEST_RESULTS_DIR%" 2>nul
 
-echo Waiting for test results: %WAIT_FILE%
+REM Check Windows Event Log for crashes
+echo Checking Windows Event Log for application crashes...
+powershell -Command "Get-WinEvent -FilterHashtable @{LogName='Application';Level=2;StartTime=(Get-Date).AddMinutes(-5)} -MaxEvents 10 -ErrorAction SilentlyContinue | Select-Object TimeCreated, ProviderName, Message | Format-List"
 
-:wait_loop
-if exist "%WAIT_FILE%" (
-    echo [OK] Found test results for %WAIT_CATEGORY% after %WAIT_SECONDS% seconds
-    goto :eof
+REM Check Windows Event Log for any MAUI-related errors
+echo Checking Windows Event Log for any .NET errors...
+powershell -Command "Get-WinEvent -FilterHashtable @{LogName='Application';StartTime=(Get-Date).AddMinutes(-5)} -MaxEvents 20 -ErrorAction SilentlyContinue | Where-Object { $_.Message -like '*MAUI*' -or $_.Message -like '*devicetest*' -or $_.Message -like '*.NET*' -or $_.ProviderName -like '*.NET*' } | Select-Object TimeCreated, ProviderName, Message | Format-List"
+
+REM List all running processes to help debug
+echo All running UWP/packaged app processes:
+powershell -Command "Get-Process | Where-Object { $_.MainWindowTitle -ne '' } | Select-Object ProcessName, Id, MainWindowTitle | Format-Table"
+
+goto :eof
+
+:launch_packaged
+REM ========================================
+REM Subroutine: Launch packaged app and wait for exit
+REM ========================================
+REM Uses Run-PackagedAppAndWait.ps1 to call IApplicationActivationManager
+REM and block on the real app PID. Unlike Start-Process shell:AppsFolder\...,
+REM this returns only after the app has fully exited and released its result
+REM file handle.
+REM
+REM Args:
+REM   %1 = Package ID (e.g. com.microsoft.maui.unittests.Controls)
+REM   %2 = Results file path (passed as first app argument, in quotes)
+REM   %3 = Optional category index (-1 for discovery, or 0+ for a specific category)
+set "LAUNCH_PKG=%~1"
+set "LAUNCH_RESULTS=%~2"
+set "LAUNCH_INDEX=%~3"
+if defined LAUNCH_INDEX (
+    set "LAUNCH_APP_ARGS=\"!LAUNCH_RESULTS!\" !LAUNCH_INDEX!"
+) else (
+    set "LAUNCH_APP_ARGS=\"!LAUNCH_RESULTS!\""
 )
-
-if %WAIT_SECONDS% GEQ %CATEGORY_TIMEOUT_SECONDS% (
-    echo [FAIL] Timeout waiting for %WAIT_CATEGORY% test results after %WAIT_SECONDS% seconds
-    set EXIT_CODE=1
-    goto :eof
-)
-
-timeout /t 1 /nobreak >nul
-set /a WAIT_SECONDS+=1
-
-if %WAIT_SECONDS%==10 echo Still waiting for %WAIT_CATEGORY%... ^(%WAIT_SECONDS%s^)
-if %WAIT_SECONDS%==30 echo Still waiting for %WAIT_CATEGORY%... ^(%WAIT_SECONDS%s^)
-if %WAIT_SECONDS%==60 echo Still waiting for %WAIT_CATEGORY%... ^(%WAIT_SECONDS%s^)
-if %WAIT_SECONDS%==120 echo Still waiting for %WAIT_CATEGORY%... ^(%WAIT_SECONDS%s^)
-if %WAIT_SECONDS%==180 echo Still waiting for %WAIT_CATEGORY%... ^(%WAIT_SECONDS%s^)
-if %WAIT_SECONDS%==240 echo Still waiting for %WAIT_CATEGORY%... ^(%WAIT_SECONDS%s^)
-if %WAIT_SECONDS%==300 echo Still waiting for %WAIT_CATEGORY%... ^(%WAIT_SECONDS%s^)
-if %WAIT_SECONDS%==360 echo Still waiting for %WAIT_CATEGORY%... ^(%WAIT_SECONDS%s^)
-if %WAIT_SECONDS%==420 echo Still waiting for %WAIT_CATEGORY%... ^(%WAIT_SECONDS%s^)
-
-goto :wait_loop
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Run-PackagedAppAndWait.ps1" -PackageName "!LAUNCH_PKG!" -AppArguments "!LAUNCH_APP_ARGS!" -TimeoutSeconds %CATEGORY_TIMEOUT_SECONDS%
+set LAUNCH_EXIT=!ERRORLEVEL!
+echo Packaged app launcher exited with code !LAUNCH_EXIT!
+exit /b !LAUNCH_EXIT!

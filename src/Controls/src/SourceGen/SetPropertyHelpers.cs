@@ -19,7 +19,7 @@ static class SetPropertyHelpers
 
 		if (propertyName.Equals(XmlName._CreateContent))
 			return; //already handled
-			
+
 		//TODO I believe ContentProperty should be resolved here
 		var localName = propertyName.LocalName;
 		bool attached = false;
@@ -144,10 +144,181 @@ static class SetPropertyHelpers
 				context.KeysInRD[parentVar] = [];
 			context.KeysInRD[parentVar].Add((((ValueNode)keyNode).Value as string)!);
 			var key = ((ValueNode)keyNode).Value as string;
-			writer.WriteLine($"{parentVar.ValueAccessor}[\"{key}\"] = {(getNodeValue(node, context.Compilation.ObjectType)).ValueAccessor};");
+			var escapedKey = CSharpExpressionHelpers.EscapeForString(key!);
+			writer.WriteLine($"{parentVar.ValueAccessor}[\"{escapedKey}\"] = {(getNodeValue(node, context.Compilation.ObjectType)).ValueAccessor};");
 			return;
 		}
 		writer.WriteLine($"{parentVar.ValueAccessor}.Add({getNodeValue(node, context.Compilation.ObjectType).ValueAccessor});");
+	}
+
+	/// <summary>
+	/// Adds a lazy resource to the ResourceDictionary using AddFactory.
+	/// Creates the resource on demand using a lambda, or a stable local function when replacing an entry.
+	/// </summary>
+	public static void AddLazyResourceToResourceDictionary(IndentedTextWriter writer, ILocalValue parentVar, ElementNode node, SourceGenContext context, string? replacementFactoryName = null)
+	{
+		// Get the type of the resource
+		if (!node.XmlType.TryResolveTypeSymbol(null, context.Compilation, context.XmlnsCache, context.TypeCache, out var type) || type is null)
+			return;
+
+		// Determine if this is an implicit style
+		bool hasKey = node.Properties.TryGetValue(XmlName.xKey, out var keyNode);
+		bool isImplicitStyle = !hasKey && node.XmlType.Name == "Style";
+
+		// Validate x:Key if present (same validation as CanAddToResourceDictionary)
+		string? key = null;
+		if (hasKey)
+		{
+			if (keyNode is not ValueNode vKeyNode || vKeyNode.Value is not string keyStr)
+			{
+				context.ReportDiagnostic(Diagnostic.Create(Descriptors.XamlParserError, LocationCreate(context.ProjectItem.RelativePath!, (IXmlLineInfo)keyNode!, ""), "x:Key must be a string literal"));
+				return;
+			}
+			key = keyStr;
+
+			// Check for duplicate keys
+			if (!context.KeysInRD.TryGetValue(parentVar, out var keysInUse))
+			{
+				context.KeysInRD[parentVar] = keysInUse = [];
+			}
+			if (keysInUse.Contains(key))
+			{
+				var location = LocationCreate(context.ProjectItem.RelativePath!, (IXmlLineInfo)keyNode, key);
+				context.ReportDiagnostic(Diagnostic.Create(Descriptors.DuplicateKeyInRD, location, key));
+				return;
+			}
+			keysInUse.Add(key);
+		}
+
+		// Get the x:Shared attribute (default is true)
+		bool shared = true;
+		if (node.Properties.TryGetValue(XmlName.xShared, out var sharedNode))
+		{
+			if (sharedNode is ValueNode vn && vn.Value is string sharedStr)
+			{
+				shared = !sharedStr.Equals("false", StringComparison.OrdinalIgnoreCase);
+			}
+		}
+
+		string resourceKeyExpression;
+		if (isImplicitStyle)
+		{
+			// Get TargetType from Style
+			var targetTypeExpr = GetStyleTargetTypeExpression(node, context);
+			if (targetTypeExpr == null)
+			{
+				context.ReportDiagnostic(Diagnostic.Create(Descriptors.XamlParserError, LocationCreate(context.ProjectItem.RelativePath!, (IXmlLineInfo)node, ""), "Implicit style requires a TargetType"));
+				return;
+			}
+
+			resourceKeyExpression = targetTypeExpr;
+		}
+		else
+		{
+			resourceKeyExpression = $"\"{CSharpExpressionHelpers.EscapeForString(key!)}\"";
+		}
+
+		if (replacementFactoryName is not null)
+		{
+			// A stable local function avoids anonymous-lambda identity churn across EnC deltas.
+			var returnType = isImplicitStyle ? "global::Microsoft.Maui.Controls.Style" : "object";
+			writer.WriteLine($"{returnType} {replacementFactoryName}()");
+		}
+		else
+			writer.WriteLine($"{parentVar.ValueAccessor}.AddFactory({resourceKeyExpression}, () =>");
+
+		using (PrePost.NewBlock(writer, begin: "{", end: replacementFactoryName is not null
+			? "}" : $"}}, shared: {shared.ToString().ToLowerInvariant()});"))
+		{
+			// Create a temporary context for generating the lambda body
+			var lambdaContext = new SourceGenContext(
+				writer,
+				context.Compilation,
+				context.SourceProductionContext,
+				context.XmlnsCache,
+				context.TypeCache,
+				context.RootType,
+				null,
+				context.ProjectItem,
+				context.ReportDiagnostic)
+			{
+				ParentContext = context
+			};
+
+			// First pass: Create all values (node and its descendants) using CreateValuesVisitor
+			// This mirrors the normal flow: CreateValuesVisitor walks the entire tree first
+			node.Accept(new CreateValuesVisitor(lambdaContext), null);
+
+			// Second pass: Set namescopes and register names in the namescope
+			node.Accept(new SetNamescopesAndRegisterNamesVisitor(lambdaContext), null);
+
+			// Third pass: Set resources in ResourceDictionary
+			node.Accept(new SetResourcesVisitor(lambdaContext), null);
+
+			// Fourth pass: Set properties on all nodes using SetPropertiesVisitor
+			// stopOnResourceDictionary=true prevents infinite recursion if there are nested RDs
+			node.Accept(new SetPropertiesVisitor(lambdaContext, stopOnResourceDictionary: true), null);
+
+			// Return the created object
+			if (lambdaContext.Variables.TryGetValue(node, out var nodeVar))
+			{
+				writer.WriteLine($"return {nodeVar.ValueAccessor};");
+			}
+			else
+			{
+				// Fallback - shouldn't happen
+				writer.WriteLine($"return null!;");
+			}
+		}
+
+		if (replacementFactoryName is not null)
+		{
+			var keyExpression = isImplicitStyle ? $"{resourceKeyExpression}.FullName!" : resourceKeyExpression;
+			writer.WriteLine($"{parentVar.ValueAccessor}.Remove({keyExpression});");
+			writer.WriteLine($"{parentVar.ValueAccessor}.AddFactory({resourceKeyExpression}, {replacementFactoryName}, shared: {shared.ToString().ToLowerInvariant()});");
+		}
+	}
+
+	/// <summary>
+	/// Gets the TargetType expression for a Style node.
+	/// </summary>
+	static string? GetStyleTargetTypeExpression(ElementNode node, SourceGenContext context)
+	{
+		if (!node.Properties.TryGetValue(new XmlName("", "TargetType"), out var targetTypeNode))
+			return null;
+
+		// Case 1: String value - TargetType="Label"
+		if (targetTypeNode is ValueNode valueNode && valueNode.Value is string typeName)
+		{
+			var typeSymbol = typeName.GetTypeSymbol(context, node);
+			if (typeSymbol != null)
+				return $"typeof({typeSymbol.ToFQDisplayString()})";
+			return null;
+		}
+
+		// Case 2: TypeExtension markup - TargetType="{x:Type Label}"
+		if (targetTypeNode is ElementNode elementNode &&
+			(elementNode.XmlType.Name == "TypeExtension" || elementNode.XmlType.Name == "Type"))
+		{
+			// TypeExtension can have TypeName as property or positional argument
+			if (elementNode.Properties.TryGetValue(new XmlName("", "TypeName"), out var typeNameNode) &&
+				typeNameNode is ValueNode tn)
+			{
+				var typeNameStr = tn.Value as string;
+				var typeSymbol = typeNameStr!.GetTypeSymbol(context, node);
+				if (typeSymbol != null)
+					return $"typeof({typeSymbol.ToFQDisplayString()})";
+			}
+			else if (elementNode.CollectionItems.Count > 0 && elementNode.CollectionItems[0] is ValueNode positionalArg)
+			{
+				var typeNameStr = positionalArg.Value as string;
+				var typeSymbol = typeNameStr!.GetTypeSymbol(context, node);
+				if (typeSymbol != null)
+					return $"typeof({typeSymbol.ToFQDisplayString()})";
+			}
+		}
+
+		return null;
 	}
 
 	static bool CanSet(ILocalValue parentVar, string localName, INode node, SourceGenContext context)
@@ -230,6 +401,16 @@ static class SetPropertyHelpers
 		// Handle lambda expressions
 		if (vn.Value is Expression expression)
 		{
+			// Check for method group reference in lambda body (missing parentheses)
+			var methodGroupRef = CSharpExpressionHelpers.DetectLambdaMethodGroupReference(expression.Code);
+			if (methodGroupRef != null)
+			{
+				var (methodGroup, suggestion) = methodGroupRef.Value;
+				var location = LocationCreate(context.ProjectItem.RelativePath!, (IXmlLineInfo)valueNode, expression.Code);
+				context.ReportDiagnostic(Diagnostic.Create(Descriptors.LambdaMethodGroupReference, location, methodGroup, suggestion));
+				return;
+			}
+
 			if (treeOrder && icWriter != null && inflatorVar != null)
 			{
 				writer = icWriter;
@@ -283,7 +464,7 @@ static class SetPropertyHelpers
 	static bool CanSetValue(IFieldSymbol? bpFieldSymbol, INode node, ITypeSymbol parentType, string localName, SourceGenContext context, NodeSGExtensions.GetNodeValueDelegate getNodeValue, out string? explicitPropertyName)
 	{
 		explicitPropertyName = null;
-		
+
 		if (bpFieldSymbol != null)
 		{
 			// Normal BP case - apply existing logic
@@ -311,13 +492,13 @@ static class SetPropertyHelpers
 
 			if (localVar.Type.InheritsFrom(bpTypeAndConverter?.type!, context))
 				return true;
-		
+
 			if (bpFieldSymbol.Type.IsInterface() && localVar.Type.Implements(bpTypeAndConverter?.type!))
 				return true;
 
 			return false;
 		}
-		
+
 		// Heuristic: If BP is null but the type has a property/field with a BindablePropertyAttribute,
 		// assume the BP will be generated by another source generator
 		// Only apply this for non-BindingBase nodes (CanSetBinding handles BindingBase)
@@ -325,25 +506,25 @@ static class SetPropertyHelpers
 		{
 			return parentType.HasBindablePropertyHeuristic(localName, context, out explicitPropertyName);
 		}
-		
+
 		return false;
 	}
 
 	static void SetValue(IndentedTextWriter writer, ILocalValue parentVar, IFieldSymbol? bpFieldSymbol, string localName, string? explicitPropertyName, INode node, SourceGenContext context, NodeSGExtensions.GetNodeValueDelegate getNodeValue)
 	{
 		// Determine bindable property name: use BP field symbol if available, otherwise use heuristic
-		var bpName = bpFieldSymbol != null 
-			? bpFieldSymbol.ToFQDisplayString() 
+		var bpName = bpFieldSymbol != null
+			? bpFieldSymbol.ToFQDisplayString()
 			: $"{parentVar.Type.ToFQDisplayString()}.{explicitPropertyName ?? $"{localName}Property"}";
-		
+
 		var pType = bpFieldSymbol?.GetBPTypeAndConverter(context)?.type;
 		var property = bpFieldSymbol == null ? parentVar.Type.GetAllProperties(localName, context).FirstOrDefault() : null;
-		
+
 		if (node is ValueNode valueNode)
 		{
 			using (context.ProjectItem.EnableLineInfo ? PrePost.NewLineInfo(writer, (IXmlLineInfo)node, context.ProjectItem) : PrePost.NoBlock())
 			{
-				var valueString = bpFieldSymbol != null 
+				var valueString = bpFieldSymbol != null
 					? valueNode.ConvertTo(bpFieldSymbol, writer, context, parentVar)
 					: (property != null ? valueNode.ConvertTo(property, writer, context, parentVar) : getNodeValue(node, context.Compilation.ObjectType).ValueAccessor);
 				writer.WriteLine($"{parentVar.ValueAccessor}.SetValue({bpName}, {valueString});");
@@ -355,7 +536,7 @@ static class SetPropertyHelpers
 			{
 				var localVar = getNodeValue(elementNode, context.Compilation.ObjectType);
 				var cast = string.Empty;
-				
+
 				if (bpFieldSymbol != null)
 				{
 					// BP case: check for double implicit conversion first
@@ -376,13 +557,13 @@ static class SetPropertyHelpers
 				{
 					cast = $"({property.Type.ToFQDisplayString()})";
 				}
-				
+
 				writer.WriteLine($"{parentVar.ValueAccessor}.SetValue({bpName}, {cast}{localVar.ValueAccessor});");
 			}
 		}
 	}
 
-	static bool CanGet(ILocalValue parentVar, string localName, SourceGenContext context, out ITypeSymbol? propertyType, out IPropertySymbol? propertySymbol)
+	internal static bool CanGet(ILocalValue parentVar, string localName, SourceGenContext context, out ITypeSymbol? propertyType, out IPropertySymbol? propertySymbol)
 	{
 		propertyType = null;
 		if ((propertySymbol = parentVar.Type.GetAllProperties(localName, context).FirstOrDefault()) == null)
@@ -394,7 +575,7 @@ static class SetPropertyHelpers
 		return true;
 	}
 
-	static bool CanGetValue(ILocalValue parentVar, IFieldSymbol? bpFieldSymbol, bool attached, SourceGenContext context, out ITypeSymbol? propertyType)
+	internal static bool CanGetValue(ILocalValue parentVar, IFieldSymbol? bpFieldSymbol, bool attached, SourceGenContext context, out ITypeSymbol? propertyType)
 	{
 		propertyType = null;
 		if (bpFieldSymbol == null)
@@ -456,7 +637,7 @@ static class SetPropertyHelpers
 		{
 			// Check if this conversion operator can convert fromType to toType
 			if (SymbolEqualityComparer.Default.Equals(conversionOp.Parameters[0].Type, fromType) &&
-			    SymbolEqualityComparer.Default.Equals(conversionOp.ReturnType, toType))
+				SymbolEqualityComparer.Default.Equals(conversionOp.ReturnType, toType))
 			{
 				return true;
 			}
@@ -468,15 +649,15 @@ static class SetPropertyHelpers
 		{
 			var fromIsCollection = fromType.AllInterfaces.Any(i => i.ToString() == "System.Collections.IEnumerable") && fromType.SpecialType != SpecialType.System_String;
 			var toIsCollection = toType.AllInterfaces.Any(i => i.ToString() == "System.Collections.IEnumerable") && toType.SpecialType != SpecialType.System_String;
-			
+
 			// Both must be collections, or both must be non-collections
 			if (fromIsCollection == toIsCollection)
 			{
 				// Same inheritance chain or one is an interface
 				if (fromType.InheritsFrom(toType, context) ||
-				    toType.InheritsFrom(fromType, context) ||
-				    toType.TypeKind == TypeKind.Interface ||
-				    fromType.TypeKind == TypeKind.Interface)
+					toType.InheritsFrom(fromType, context) ||
+					toType.TypeKind == TypeKind.Interface ||
+					fromType.TypeKind == TypeKind.Interface)
 				{
 					return true;
 				}
@@ -510,27 +691,27 @@ static class SetPropertyHelpers
 	static bool CanSetBinding(IFieldSymbol? bpFieldSymbol, INode node, ITypeSymbol parentType, string localName, SourceGenContext context, out string? explicitPropertyName)
 	{
 		explicitPropertyName = null;
-		
+
 		// Check if it's a BindingBase node
 		if (!IsBindingBaseNode(node, context))
 			return false;
-		
+
 		// If we have a BP field symbol, we can set binding
 		if (bpFieldSymbol != null)
 			return true;
-		
+
 		// Heuristic: If BP is null but the type has a property/field with a BindablePropertyAttribute,
 		// assume the BP will be generated by another source generator
 		if (!string.IsNullOrEmpty(localName))
 			return parentType.HasBindablePropertyHeuristic(localName, context, out explicitPropertyName);
-		
+
 		return false;
 	}
 
 	static void SetBinding(IndentedTextWriter writer, ILocalValue parentVar, IFieldSymbol? bpFieldSymbol, string localName, string? explicitPropertyName, INode node, SourceGenContext context, NodeSGExtensions.GetNodeValueDelegate getNodeValue)
 	{
 		var localVariable = getNodeValue((ElementNode)node, context.Compilation.ObjectType);
-		
+
 		if (bpFieldSymbol != null)
 		{
 			// Normal case: we have the BP field symbol
@@ -582,9 +763,9 @@ static class SetPropertyHelpers
 
 		if (localName != null)
 			//one of those will return true, but we need the propertyType
-			_ = CanGetValue(parentVar, bpFieldSymbol, attached, context, out  propertyType) || CanGet(parentVar, localName, context, out propertyType, out propertySymbol);
-		
-		else		
+			_ = CanGetValue(parentVar, bpFieldSymbol, attached, context, out propertyType) || CanGet(parentVar, localName, context, out propertyType, out propertySymbol);
+
+		else
 			propertyType = parentVar.Type;
 
 		if (CanAddToResourceDictionary(parentVar, propertyType!, (ElementNode)valueNode, context, getNodeValue))
@@ -594,7 +775,7 @@ static class SetPropertyHelpers
 				rdAccessor = new DirectValue(propertyType!, GetOrGetValue(parentVar, bpFieldSymbol, propertySymbol, valueNode, context));
 			else
 				rdAccessor = parentVar;
-				
+
 			AddToResourceDictionary(writer, rdAccessor, (ElementNode)valueNode, context, getNodeValue);
 			return;
 		}
@@ -672,7 +853,7 @@ static class SetPropertyHelpers
 		}
 
 		// Analyze the expression for mixed local+binding scenarios
-		var analysis = ExpressionAnalyzer.Analyze(expression.Code, "__source", dataTypeSymbol, context.RootType);
+		var analysis = ExpressionAnalyzer.Analyze(expression.Code, "__source", dataTypeSymbol, context.RootType, context.Compilation);
 
 		// Check for ambiguity first - resolve the expression
 		var resolution = MemberResolver.Resolve(expression.Code, context.RootType, dataTypeSymbol, context.Compilation);
@@ -684,7 +865,7 @@ static class SetPropertyHelpers
 			context.ReportDiagnostic(Diagnostic.Create(Descriptors.AmbiguousMemberExpression, bothLocation, resolution.RootIdentifier, context.RootType?.Name ?? "this", dataTypeSymbol.Name));
 			return true; // Handled (with error)
 		}
-		
+
 		// Warn if member name conflicts with a well-known static type
 		if (resolution.ConflictsWithStaticType)
 		{
@@ -695,13 +876,42 @@ static class SetPropertyHelpers
 		}
 
 		// Handle not-found case for simple identifiers
-		if (resolution.Location == MemberLocation.Neither && 
-			!string.IsNullOrEmpty(resolution.RootIdentifier) && 
-			MemberResolver.IsSimpleIdentifier(expression.Code))
+		if (resolution.Location == MemberLocation.Neither &&
+			!string.IsNullOrEmpty(resolution.RootIdentifier) &&
+			MemberResolver.IsSimpleIdentifier(expression.Code) &&
+			!resolution.ResolvesToStaticType)
 		{
 			var neitherLocation = LocationCreate(context.ProjectItem.RelativePath!, (IXmlLineInfo)valueNode, expression.Code);
 			context.ReportDiagnostic(Diagnostic.Create(Descriptors.MemberNotFound, neitherLocation, resolution.RootIdentifier, context.RootType?.Name ?? "this", dataTypeSymbol.Name));
 			return true; // Handled (with error)
+		}
+
+		// Validate identifiers inside interpolated string holes
+		if (expression.Code.StartsWith("$\"", StringComparison.Ordinal) || expression.Code.StartsWith("$@\"", StringComparison.Ordinal))
+		{
+			var interpolatedIds = CSharpExpressionHelpers.ExtractInterpolatedStringIdentifierReferences(expression.Code);
+			foreach (var idReference in interpolatedIds)
+			{
+				var id = idReference.Identifier;
+				var idResolution = MemberResolver.Resolve(id, context.RootType, dataTypeSymbol, context.Compilation);
+				if (idResolution.Location == MemberLocation.Neither &&
+					!MemberResolver.HasMember(context.RootType, id, includeMethods: true) &&
+					!MemberResolver.HasMember(dataTypeSymbol, id, includeMethods: true) &&
+					!MemberResolver.ResolvesToType(context.Compilation, idReference.TypeReferenceCandidate, MemberResolver.GetContainingNamespace(context.RootType)))
+				{
+					var idLocation = LocationCreate(context.ProjectItem.RelativePath!, (IXmlLineInfo)valueNode, expression.Code);
+					context.ReportDiagnostic(Diagnostic.Create(Descriptors.MemberNotFound, idLocation, id, context.RootType?.Name ?? "this", dataTypeSymbol.Name));
+					return true; // Handled (with error)
+				}
+			}
+		}
+
+		if (resolution.Location == MemberLocation.Neither &&
+			resolution.ResolvesToStaticType &&
+			MemberResolver.IsSimpleIdentifier(expression.Code))
+		{
+			// Pure static member access should be emitted as a SetValue expression, not a binding.
+			return false;
 		}
 
 		// If we have binding handlers, this needs a TypedBinding
@@ -737,11 +947,86 @@ static class SetPropertyHelpers
 
 	/// <summary>
 	/// Generates a TypedBinding for a C# expression that references x:DataType members.
+	/// Overload for UC: accepts string accessors instead of IC's ILocalValue/IFieldSymbol.
+	/// </summary>
+	internal static void SetExpressionBindingForUC(IndentedTextWriter writer, string targetAccessor, string bpFieldFqn, string expression, ITypeSymbol dataTypeSymbol, INamedTypeSymbol rootType, Compilation compilation)
+	{
+		var sourceTypeName = dataTypeSymbol.ToFQDisplayString();
+
+		var transformedExpression = CSharpExpressionHelpers.TransformQuotesWithSemantics(
+			expression, compilation, dataTypeSymbol, rootType);
+
+		var analysis = ExpressionAnalyzer.Analyze(transformedExpression, "__source", dataTypeSymbol, rootType, compilation);
+		var handlers = analysis.Handlers;
+
+		var expressionType = ResolveExpressionType(expression, dataTypeSymbol, context: null);
+		var propertyTypeName = expressionType?.ToFQDisplayString() ?? "object";
+
+		bool hasCaptures = analysis.Captures.Count > 0;
+		if (hasCaptures)
+		{
+			writer.WriteLine("{");
+			writer.Indent++;
+			foreach (var capture in analysis.Captures)
+			{
+				writer.WriteLine($"var {capture.CaptureVariable} = this.{capture.InvocationExpression};");
+			}
+		}
+
+		writer.WriteLine($"{targetAccessor}.SetBinding({bpFieldFqn},");
+		writer.Indent++;
+		writer.WriteLine($"new global::Microsoft.Maui.Controls.Internals.TypedBinding<{sourceTypeName}, {propertyTypeName}>(");
+		writer.Indent++;
+
+		var getterExpression = analysis.TransformedExpression;
+		if (getterExpression.Contains("?.") && !getterExpression.EndsWith("!", StringComparison.Ordinal))
+			getterExpression += "!";
+		writer.WriteLine($"__source => ({getterExpression}, true),");
+
+		// UC intentionally skips the ExpressionNotSettable diagnostic (Descriptors.ExpressionNotSettable)
+		// that IC emits for TwoWay-default BPs with non-settable expressions. During hot reload,
+		// the developer is iterating rapidly and a warning would be noise — the IC already warned at build time.
+		var writeInfo = GetExpressionWriteInfo(expression, dataTypeSymbol, context: null);
+		if (analysis.IsSettable && writeInfo.Kind == ExpressionWriteKind.DirectAssignment)
+			writer.WriteLine($"(__source, __value) => {analysis.TransformedExpression} = __value,");
+		else if (analysis.IsSettable && writeInfo.Kind == ExpressionWriteKind.StructCopyWriteback)
+			WriteStructCopyWritebackSetter(writer, writeInfo.Chain!);
+		else
+			writer.WriteLine("null,");
+
+		if (handlers.Count == 0)
+		{
+			writer.WriteLine($"null));");
+		}
+		else
+		{
+			writer.WriteLine($"new global::System.Tuple<global::System.Func<{sourceTypeName}, object>, string>[] {{");
+			writer.Indent++;
+			for (int i = 0; i < handlers.Count; i++)
+			{
+				var handler = handlers[i];
+				var comma = i < handlers.Count - 1 ? "," : "";
+				writer.WriteLine($"new(static __source => {handler.ParentExpression}, \"{handler.PropertyName}\"){comma}");
+			}
+			writer.Indent--;
+			writer.WriteLine($"}}));");
+		}
+		writer.Indent -= 2;
+
+		if (hasCaptures)
+		{
+			writer.Indent--;
+			writer.WriteLine("}");
+		}
+	}
+
+	/// <summary>
+	/// Generates a TypedBinding for a C# expression that references x:DataType members.
 	/// </summary>
 	static void SetExpressionBinding(IndentedTextWriter writer, ILocalValue parentVar, IFieldSymbol bpFieldSymbol, string expression, ITypeSymbol dataTypeSymbol, SourceGenContext context, ValueNode valueNode)
 	{
 		var bpName = bpFieldSymbol.ToFQDisplayString();
-		
+
 		var sourceTypeName = dataTypeSymbol.ToFQDisplayString();
 
 		// Transform quotes with semantic context - char literals stay as char only if target expects char
@@ -749,7 +1034,7 @@ static class SetPropertyHelpers
 			expression, context.Compilation, dataTypeSymbol, context.RootType);
 
 		// Analyze expression for mixed local+binding scenarios
-		var analysis = ExpressionAnalyzer.Analyze(transformedExpression, "__source", dataTypeSymbol, context.RootType);
+		var analysis = ExpressionAnalyzer.Analyze(transformedExpression, "__source", dataTypeSymbol, context.RootType, context.Compilation);
 		var handlers = analysis.Handlers;
 
 		// Resolve the expression's result type for TProperty.
@@ -783,30 +1068,37 @@ static class SetPropertyHelpers
 			// TransformedExpression already has identifiers prefixed with __source. where needed
 			// Add null-forgiving operator if expression contains ?. to suppress nullability warnings
 			var getterExpression = analysis.TransformedExpression;
-			if (getterExpression.Contains("?."))
+			if (getterExpression.Contains("?.") && !getterExpression.EndsWith("!", StringComparison.Ordinal))
 				getterExpression += "!";
 			writer.WriteLine($"__source => ({getterExpression}, true),");
-			
+
 			// Generate setter if expression is a simple property chain AND the terminal property is writable
-			if (analysis.IsSettable && IsExpressionWritable(expression, dataTypeSymbol, context))
+			var writeInfo = GetExpressionWriteInfo(expression, dataTypeSymbol, context);
+			if (analysis.IsSettable && writeInfo.Kind == ExpressionWriteKind.DirectAssignment)
 			{
 				writer.WriteLine($"(__source, __value) => {analysis.TransformedExpression} = __value,");
+			}
+			else if (analysis.IsSettable && writeInfo.Kind == ExpressionWriteKind.StructCopyWriteback)
+			{
+				WriteStructCopyWritebackSetter(writer, writeInfo.Chain!);
 			}
 			else
 			{
 				writer.WriteLine($"null,");
-				// Emit info diagnostic when binding a complex expression to a TwoWay property
+				// Emit diagnostics when binding a complex expression to a TwoWay property
 				if (IsTwoWayByDefault(bpFieldSymbol))
 				{
 					var location = LocationCreate(context.ProjectItem.RelativePath!, (IXmlLineInfo)valueNode, expression);
 					context.ReportDiagnostic(Diagnostic.Create(
-						Descriptors.ExpressionNotSettable,
+						writeInfo.Kind == ExpressionWriteKind.StructIntermediateNotSettable
+							? Descriptors.StructIntermediateNotSettable
+							: Descriptors.ExpressionNotSettable,
 						location,
 						expression,
 						bpFieldSymbol.Name));
 				}
 			}
-			
+
 			// Generate handlers array
 			if (handlers.Count == 0)
 			{
@@ -841,7 +1133,7 @@ static class SetPropertyHelpers
 	/// For example, "Price" on SimpleViewModel resolves to decimal, "User.DisplayName" resolves to string.
 	/// For complex expressions (operators, method calls, interpolation), returns null to fall back to object.
 	/// </summary>
-	static ITypeSymbol? ResolveExpressionType(string expression, ITypeSymbol dataType, SourceGenContext context)
+	internal static ITypeSymbol? ResolveExpressionType(string expression, ITypeSymbol dataType, SourceGenContext? context)
 	{
 		if (string.IsNullOrWhiteSpace(expression))
 			return null;
@@ -920,15 +1212,41 @@ static class SetPropertyHelpers
 	}
 
 	/// <summary>
-	/// Checks if the terminal property in a C# expression chain is writable (has a public setter).
-	/// For example, "Name" is writable if Name has a public set accessor, but "ReadOnlyProp" is not
-	/// if it only has a getter (expression-bodied or getter-only property).
-	/// Returns false for complex expressions that are not simple property chains.
+	/// Describes how a C# expression can be used as a binding setter.
 	/// </summary>
-	static bool IsExpressionWritable(string expression, ITypeSymbol dataType, SourceGenContext context)
+	enum ExpressionWriteKind
 	{
+		/// <summary>Cannot generate a setter (terminal not writable, or not a property chain).</summary>
+		NotWritable,
+		/// <summary>Simple direct assignment: __source.Prop = __value.</summary>
+		DirectAssignment,
+		/// <summary>Needs copy-modify-writeback pattern for struct intermediates.</summary>
+		StructCopyWriteback,
+		/// <summary>Has struct intermediate but the intermediate property has no setter.</summary>
+		StructIntermediateNotSettable,
+	}
+
+	readonly struct ExpressionWriteInfo
+	{
+		public ExpressionWriteKind Kind { get; init; }
+		/// <summary>
+		/// For StructCopyWriteback: the chain of property names from root to terminal.
+		/// Each bool indicates whether that property is a value-type intermediate requiring writeback.
+		/// </summary>
+		public (string Name, bool IsStructIntermediate)[]? Chain { get; init; }
+	}
+
+	/// <summary>
+	/// Analyzes whether a C# expression property chain can generate a setter,
+	/// and if so, what kind of setter is needed.
+	/// Handles value type (struct) intermediates that require copy-modify-writeback.
+	/// </summary>
+	static ExpressionWriteInfo GetExpressionWriteInfo(string expression, ITypeSymbol dataType, SourceGenContext? context)
+	{
+		var notWritable = new ExpressionWriteInfo { Kind = ExpressionWriteKind.NotWritable };
+
 		if (string.IsNullOrWhiteSpace(expression))
-			return false;
+			return notWritable;
 
 		var expr = expression.Trim();
 
@@ -944,50 +1262,118 @@ static class SetPropertyHelpers
 			expr = expr.Substring("BindingContext.".Length);
 
 		if (string.IsNullOrEmpty(expr))
-			return false;
+			return notWritable;
 
 		// Walk the dot-separated property chain (also handle ?. null-conditional access)
 		var parts = expr.Replace("?.", ".").Split('.');
 		var currentType = dataType;
 		IPropertySymbol? lastProperty = null;
+		var chain = new (string Name, bool IsStructIntermediate)[parts.Length];
+		bool hasStructIntermediate = false;
+		bool hasUnsettableStructIntermediate = false;
 
-		foreach (var part in parts)
+		for (int i = 0; i < parts.Length; i++)
 		{
-			var memberName = part.Trim().TrimEnd('!');
+			var memberName = parts[i].Trim().TrimEnd('!');
 
 			// If it contains parens, operators, or special chars, it's not a simple property chain
 			if (memberName.Contains('(') || memberName.Contains(' ') || memberName.Contains('[') || string.IsNullOrEmpty(memberName))
-				return false;
+				return notWritable;
 
 			var member = currentType.GetAllMembers(memberName, context).FirstOrDefault();
 			if (member is IPropertySymbol prop)
 			{
 				lastProperty = prop;
 				currentType = prop.Type;
+
+				bool isStructIntermediate = i < parts.Length - 1 && currentType.IsValueType;
+				chain[i] = (memberName, isStructIntermediate);
+
+				if (isStructIntermediate)
+				{
+					hasStructIntermediate = true;
+					// Check if this intermediate property has a setter (needed for writeback)
+					bool intermediateSettable = prop.SetMethod is not null
+						&& prop.SetMethod.DeclaredAccessibility == Accessibility.Public
+						&& !prop.SetMethod.IsInitOnly;
+					if (!intermediateSettable)
+						hasUnsettableStructIntermediate = true;
+				}
 			}
 			else if (member is IFieldSymbol field)
 			{
 				if (field.IsReadOnly)
-					return false;
+					return notWritable;
 				lastProperty = null;
+				chain[i] = (memberName, false); // Fields don't need writeback
 				currentType = field.Type;
 			}
 			else
 			{
-				return false;
+				return notWritable;
 			}
 		}
 
 		// Check if the terminal property has a public, non-init setter
 		if (lastProperty is not null)
 		{
-			return lastProperty.SetMethod is not null
+			bool terminalWritable = lastProperty.SetMethod is not null
 				&& lastProperty.SetMethod.DeclaredAccessibility == Accessibility.Public
 				&& !lastProperty.SetMethod.IsInitOnly;
+			if (!terminalWritable)
+				return notWritable;
 		}
 
-		// For fields, assume writable
-		return true;
+		if (hasUnsettableStructIntermediate)
+			return new ExpressionWriteInfo { Kind = ExpressionWriteKind.StructIntermediateNotSettable };
+
+		if (hasStructIntermediate)
+			return new ExpressionWriteInfo { Kind = ExpressionWriteKind.StructCopyWriteback, Chain = chain };
+
+		return new ExpressionWriteInfo { Kind = ExpressionWriteKind.DirectAssignment };
+	}
+
+	/// <summary>
+	/// Generates a copy-modify-writeback setter for expressions with value type (struct) intermediates.
+	/// For example, {Margin.Top} generates:
+	/// <c>(__source, __value) =&gt; { var __t0 = __source.Margin; __t0.Top = __value; __source.Margin = __t0; },</c>
+	/// </summary>
+	static void WriteStructCopyWritebackSetter(IndentedTextWriter writer, (string Name, bool IsStructIntermediate)[] chain)
+	{
+		writer.Write("(__source, __value) => { ");
+
+		string currentAccessor = "__source";
+		var structStack = new System.Collections.Generic.List<(string TempVar, string ParentAccessor, string PropertyName)>();
+		int tempIndex = 0;
+
+		// Process non-terminal parts
+		for (int i = 0; i < chain.Length - 1; i++)
+		{
+			var (name, isStruct) = chain[i];
+			if (isStruct)
+			{
+				var tempVar = $"__t{tempIndex++}";
+				writer.Write($"var {tempVar} = {currentAccessor}.{name}; ");
+				structStack.Add((tempVar, currentAccessor, name));
+				currentAccessor = tempVar;
+			}
+			else
+			{
+				currentAccessor = $"{currentAccessor}.{name}";
+			}
+		}
+
+		// Terminal assignment
+		writer.Write($"{currentAccessor}.{chain[chain.Length - 1].Name} = __value; ");
+
+		// Write back struct copies in reverse order
+		for (int i = structStack.Count - 1; i >= 0; i--)
+		{
+			var (tempVar, parent, propName) = structStack[i];
+			writer.Write($"{parent}.{propName} = {tempVar}; ");
+		}
+
+		writer.WriteLine("},");
 	}
 
 }

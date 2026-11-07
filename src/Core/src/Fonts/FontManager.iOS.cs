@@ -1,12 +1,13 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using Foundation;
 using Microsoft.Extensions.Logging;
 using UIKit;
 
 namespace Microsoft.Maui
 {
 	/// <inheritdoc/>
-	public class FontManager : IFontManager
+	public class FontManager : IFontManager, IDisposable
 	{
 		// UIFontWeight[Constant] is internal in Xamarin.iOS but the convertion from
 		// the public (int-based) enum is not helpful in this case.
@@ -28,6 +29,7 @@ namespace Microsoft.Maui
 		readonly IFontRegistrar _fontRegistrar;
 		readonly IServiceProvider? _serviceProvider;
 
+		NSObject? _contentSizeCategoryObserver;
 		UIFont? _defaultFont;
 
 		/// <summary>
@@ -40,11 +42,16 @@ namespace Microsoft.Maui
 		{
 			_fontRegistrar = fontRegistrar;
 			_serviceProvider = serviceProvider;
+
+			// When the preferred content size category changes (Dynamic Type),
+			// clear the font cache so subsequent requests create new fonts
+			// with the current content size category scaling.
+			_contentSizeCategoryObserver = UIApplication.Notifications.ObserveContentSizeCategoryChanged((sender, args) => _fonts.Clear());
 		}
 
 		/// <inheritdoc/>
 		public UIFont DefaultFont =>
-			_defaultFont ??= UIFont.SystemFontOfSize(UIFont.SystemFontSize);
+			_defaultFont ??= UIFont.SystemFontOfSize(UIFont.SystemFontSize)!;
 
 		static double? defaultFontSize;
 
@@ -151,9 +158,12 @@ namespace Microsoft.Maui
 					}
 
 					var cleansedFont = CleanseFontName(family);
-					result = UIFont.FromName(cleansedFont, size);
-					if (result != null)
-						return ApplyScaling(font, result);
+					if (cleansedFont is not null)
+					{
+						result = UIFont.FromName(cleansedFont, size);
+						if (result != null)
+							return ApplyScaling(font, result);
+					}
 
 					result = UIFont.FromName(family, size);
 					if (result != null)
@@ -167,12 +177,12 @@ namespace Microsoft.Maui
 
 			if (hasAttributes)
 			{
-				var defaultFont = UIFont.SystemFontOfSize(size);
+				var defaultFont = UIFont.SystemFontOfSize(size)!;
 				var descriptor = defaultFont.FontDescriptor.CreateWithAttributes(GetFontAttributes(font));
-				return ApplyScaling(font, UIFont.FromDescriptor(descriptor, size));
+				return ApplyScaling(font, UIFont.FromDescriptor(descriptor, size)!);
 			}
 
-			return ApplyScaling(font, UIFont.SystemFontOfSize(size));
+			return ApplyScaling(font, UIFont.SystemFontOfSize(size)!);
 
 			UIFont ApplyScaling(Font font, UIFont uiFont)
 			{
@@ -181,6 +191,12 @@ namespace Microsoft.Maui
 
 				return uiFont;
 			}
+		}
+
+		public void Dispose()
+		{
+			_contentSizeCategoryObserver?.Dispose();
+			_contentSizeCategoryObserver = null;
 		}
 
 		string? CleanseFontName(string fontName)

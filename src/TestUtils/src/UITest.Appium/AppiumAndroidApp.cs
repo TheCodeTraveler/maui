@@ -22,7 +22,6 @@ namespace UITest.Appium
 		{
 			var device = config.GetProperty<string>("EmulatorDeviceName");
 			var apkPath = config.GetProperty<string>("AppPath");
-			var pkgName = config.GetProperty<string>("AppId");
 			var outDir = config.GetProperty<string>("ReportDirectory");
 			var enableDebugPopup = config.GetProperty<bool>("EnableDebugPopup");
 			var avdForce = config.GetProperty<bool>("AvdForceInstall");
@@ -39,8 +38,36 @@ namespace UITest.Appium
 			//// TODO: Check for installed package first?
 			//AndroidEmulator.InstallPackage(apkPath, pkgName, outDir);
 			var androidApp = new AppiumAndroidApp(remoteAddress, config);
-			androidApp.Driver.ActivateApp(pkgName);
+			androidApp.ActivateApp(forceRestart: true);
 			return androidApp;
+		}
+
+		internal void ActivateApp(bool forceRestart = false)
+		{
+			var appId = this.GetAppId();
+			var args = GetTestConfigurationArgs(Config);
+			if (string.IsNullOrEmpty(args))
+			{
+				Driver.ActivateApp(appId);
+				return;
+			}
+
+			Driver.ExecuteScript("mobile: startActivity", new Dictionary<string, object>
+			{
+				{ "component", $"{appId}/{appId}.MainActivity" },
+				{ "action", "android.intent.action.MAIN" },
+				{ "categories", new[] { "android.intent.category.LAUNCHER" } },
+				{ "flags", "0x10200000" },
+				{ "extras", new[] { new[] { "s", "TEST_CONFIGURATION_ARGS", args } } },
+				{ "wait", true },
+				{ "stop", forceRestart },
+			});
+		}
+
+		static string? GetTestConfigurationArgs(IConfig config)
+		{
+			var args = config.GetProperty<Dictionary<string, string>>("TestConfigurationArgs");
+			return args is not null && args.TryGetValue("TEST_CONFIGURATION_ARGS", out var value) ? value : null;
 		}
 
 		public override IUIElementQueryable Query => new AppiumAndroidQueryable(this);
@@ -89,6 +116,9 @@ namespace UITest.Appium
 
 			SetGeneralAppiumOptions(config, options);
 
+			if (!string.IsNullOrEmpty(GetTestConfigurationArgs(config)))
+				options.AddAdditionalAppiumOption("autoLaunch", false);
+
 			if (!string.IsNullOrWhiteSpace(appId))
 			{
 				options.AddAdditionalAppiumOption(MobileCapabilityType.NoReset, "true");
@@ -121,6 +151,12 @@ namespace UITest.Appium
 			// Whether to disable window animations when starting the instrumentation process.
 			// The animation scale will be restored automatically after the instrumentation process ends.
 			options.AddAdditionalAppiumOption("appium:disableWindowAnimation", true);
+
+			// On some emulator images (e.g. API 30 on hosted CI agents), the
+			// settings service may not fully support hidden_api_policy commands.
+			// This causes UiAutomator2 to throw "Can't find service: settings".
+			// Ignoring this non-critical error allows tests to proceed normally.
+			options.AddAdditionalAppiumOption("appium:ignoreHiddenApiPolicyError", true);
 
 			return options;
 		}

@@ -4,9 +4,7 @@ using PlatformView = Microsoft.Maui.Platform.MauiActivityIndicator;
 using PlatformView = Android.Widget.ProgressBar;
 #elif WINDOWS
 using PlatformView = Microsoft.UI.Xaml.Controls.ProgressRing;
-#elif TIZEN
-using PlatformView = Tizen.UIExtensions.NUI.GraphicsView.ActivityIndicator;
-#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID && !TIZEN)
+#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID)
 using PlatformView = System.Object;
 #endif
 
@@ -22,8 +20,8 @@ namespace Microsoft.Maui.Handlers
 		{
 			[nameof(IActivityIndicator.Color)] = MapColor,
 			[nameof(IActivityIndicator.IsRunning)] = MapIsRunning,
-#if __ANDROID__
-			// Android does not have the concept of IsRunning, so we are leveraging the Visibility
+#if __ANDROID__ || __IOS__ || MACCATALYST
+			// Android/iOS do not respect both properties independently, so we handle Visibility explicitly
 			[nameof(IActivityIndicator.Visibility)] = MapIsRunning,
 #endif
 #if WINDOWS

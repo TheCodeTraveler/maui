@@ -28,6 +28,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Threading;
 using Microsoft.Maui.Animations;
 using Microsoft.Maui.Controls.Internals;
 using Microsoft.Maui.Dispatching;
@@ -53,6 +54,8 @@ namespace Microsoft.Maui.Controls
 		/// </summary>
 		static internal int TweenersCounter => s_tweeners.Count;
 
+		static internal bool HasTweener(int id) => s_tweeners.ContainsKey(id);
+
 		static int s_currentTweener = 1;
 
 		static AnimationExtensions()
@@ -64,7 +67,7 @@ namespace Microsoft.Maui.Controls
 
 		public static int Add(this IAnimationManager animationManager, Action<double> step)
 		{
-			var id = s_currentTweener++;
+			var id = Interlocked.Increment(ref s_currentTweener);
 			var animation = new Animation
 			{
 				Name = $"{id}",
@@ -72,19 +75,21 @@ namespace Microsoft.Maui.Controls
 				Step = step
 			};
 			s_tweeners[id] = animation;
+			animation.AnimationManagerDisposed = () => s_tweeners.TryRemove(id, out _);
 			animation.Commit(animationManager);
 
 			animation.Finished += () =>
 			{
 				s_tweeners.TryRemove(id, out _);
 				animation.Finished = null;
+				animation.AnimationManagerDisposed = null;
 			};
 			return id;
 		}
 
 		public static int Insert(this IAnimationManager animationManager, Func<long, bool> step)
 		{
-			var id = s_currentTweener++;
+			var id = Interlocked.Increment(ref s_currentTweener);
 			Animation animation = null;
 			animation = new TweenerAnimation(step)
 			{
@@ -92,12 +97,14 @@ namespace Microsoft.Maui.Controls
 				Easing = Easing.Linear,
 			};
 			s_tweeners[id] = animation;
+			animation.AnimationManagerDisposed = () => s_tweeners.TryRemove(id, out _);
 			animation.Commit(animationManager);
 
 			animation.Finished += () =>
 			{
 				s_tweeners.TryRemove(id, out _);
 				animation.Finished = null;
+				animation.AnimationManagerDisposed = null;
 			};
 
 			return id;

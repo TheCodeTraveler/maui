@@ -9,10 +9,12 @@ namespace Microsoft.Maui.Handlers
 	{
 		protected override ShapeableImageView CreatePlatformView()
 		{
-			var platformView = new MauiShapeableImageView(Context);
+			var platformView = new MauiShapeableImageView(Context, RuntimeFeature.IsMaterial3Enabled);
 
 			// These set the defaults so visually it matches up with other platforms
 			platformView.SetPadding(0, 0, 0, 0);
+			// Keep scaled images inside the content padding so they cannot cover the background stroke.
+			platformView.CropToPadding = true;
 			platformView.SoundEffectsEnabled = false;
 
 			return platformView;
@@ -62,6 +64,11 @@ namespace Microsoft.Maui.Handlers
 		{
 			handler.PlatformView?.UpdateCornerRadius(buttonStroke);
 			handler.UpdateValue(nameof(IImageButton.Padding));
+
+			if (handler.VirtualView.Shadow is not null)
+			{
+				handler.UpdateValue(nameof(IImageButton.Shadow));
+			}
 		}
 
 		public static void MapPadding(IImageButtonHandler handler, IImageButton imageButton)
@@ -78,7 +85,14 @@ namespace Microsoft.Maui.Handlers
 		void OnPlatformViewLayoutChange(object? sender, View.LayoutChangeEventArgs e)
 		{
 			if (sender is ShapeableImageView platformView && VirtualView is not null)
+			{
 				platformView.UpdateBackground(VirtualView);
+
+				if (e.Right - e.Left != e.OldRight - e.OldLeft || e.Bottom - e.Top != e.OldBottom - e.OldTop)
+				{
+					UpdateValue(nameof(IImageButton.CornerRadius));
+				}
+			}
 		}
 
 		void OnTouch(object? sender, View.TouchEventArgs e)

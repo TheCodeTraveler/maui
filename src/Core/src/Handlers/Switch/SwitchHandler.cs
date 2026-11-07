@@ -5,9 +5,7 @@ using PlatformView = UIKit.UISwitch;
 using PlatformView = AndroidX.AppCompat.Widget.SwitchCompat;
 #elif WINDOWS
 using PlatformView = Microsoft.UI.Xaml.Controls.ToggleSwitch;
-#elif TIZEN
-using PlatformView = Tizen.UIExtensions.NUI.GraphicsView.Switch;
-#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID && !TIZEN)
+#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID)
 using PlatformView = System.Object;
 #endif
 
@@ -20,6 +18,9 @@ namespace Microsoft.Maui.Handlers
 			[nameof(ISwitch.IsOn)] = MapIsOn,
 			[nameof(ISwitch.ThumbColor)] = MapThumbColor,
 			[nameof(ISwitch.TrackColor)] = MapTrackColor,
+#if WINDOWS
+			[nameof(IView.MinimumWidth)] = MapSwitchMinimumWidth,
+#endif
 		};
 
 		public static CommandMapper<ISwitch, ISwitchHandler> CommandMapper = new(ViewCommandMapper)

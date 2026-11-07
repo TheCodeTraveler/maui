@@ -34,9 +34,10 @@ namespace Microsoft.Maui.Animations
 		/// <inheritdoc/>
 		public void Add(Animation animation)
 		{
-			// If animations are disabled, don't do anything
-			if (!Ticker.SystemEnabled)
+			// If this manager cannot run the animation, release any ownership callback.
+			if (_disposedValue || !Ticker.SystemEnabled)
 			{
+				animation.OnAnimationManagerDisposed(this);
 				return;
 			}
 
@@ -84,8 +85,12 @@ namespace Microsoft.Maui.Animations
 			var milliseconds = TimeSpan.FromMilliseconds(now - _lastUpdate).TotalMilliseconds;
 			_lastUpdate = now;
 
-			var animations = new List<Animation>(_animations);
-			animations.ForEach(OnAnimationTick);
+			Animation[] animations = [.._animations];
+
+			foreach (var animation in animations)
+			{
+				OnAnimationTick(animation);
+			}
 
 			if (_animations.Count == 0)
 				End();
@@ -113,10 +118,26 @@ namespace Microsoft.Maui.Animations
 		{
 			if (!_disposedValue)
 			{
-				if (disposing && Ticker is IDisposable disposable)
-					disposable.Dispose();
-
 				_disposedValue = true;
+
+				Ticker.Fire -= OnFire;
+				End();
+
+				if (disposing)
+				{
+					Animation[] animations = [.._animations];
+					_animations.Clear();
+
+					foreach (var animation in animations)
+					{
+						animation.OnAnimationManagerDisposed(this);
+					}
+
+					if (Ticker is IDisposable disposable)
+					{
+						disposable.Dispose();
+					}
+				}
 			}
 		}
 
@@ -129,8 +150,13 @@ namespace Microsoft.Maui.Animations
 
 		void ForceFinishAnimations()
 		{
-			var animations = new List<Animation>(_animations);
-			animations.ForEach(ForceFinish);
+			Animation[] animations = [.._animations];
+
+			foreach (var animation in animations)
+			{
+				ForceFinish(animation);
+			}
+
 			End();
 
 			void ForceFinish(Animation animation)

@@ -5,9 +5,7 @@ using PlatformView = Microsoft.Maui.Platform.MauiTextField;
 using PlatformView = AndroidX.AppCompat.Widget.AppCompatEditText;
 #elif WINDOWS
 using PlatformView = Microsoft.UI.Xaml.Controls.TextBox;
-#elif TIZEN
-using PlatformView = Tizen.UIExtensions.NUI.Entry;
-#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID && !TIZEN)
+#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID)
 using PlatformView = System.Object;
 #endif
 
@@ -17,7 +15,12 @@ namespace Microsoft.Maui.Handlers
 {
 	public partial class EntryHandler : IEntryHandler
 	{
-		public static IPropertyMapper<IEntry, IEntryHandler> Mapper = new PropertyMapper<IEntry, IEntryHandler>(ViewHandler.ViewMapper)
+		private static readonly IPropertyMapper<IEntry, IEntryHandler> EntryPriorityMapper = new PropertyMapper<IEntry, IEntryHandler>()
+		{
+			[nameof(IEntry.MaxLength)] = MapMaxLength,
+		};
+
+		public static IPropertyMapper<IEntry, IEntryHandler> Mapper = new PropertyMapper<IEntry, IEntryHandler>(ViewHandler.ViewMapper, EntryPriorityMapper)
 		{
 			[nameof(IEntry.Background)] = MapBackground,
 			[nameof(IEntry.CharacterSpacing)] = MapCharacterSpacing,
@@ -30,7 +33,6 @@ namespace Microsoft.Maui.Handlers
 			[nameof(IEntry.IsTextPredictionEnabled)] = MapIsTextPredictionEnabled,
 			[nameof(IEntry.IsSpellCheckEnabled)] = MapIsSpellCheckEnabled,
 			[nameof(IEntry.Keyboard)] = MapKeyboard,
-			[nameof(IEntry.MaxLength)] = MapMaxLength,
 			[nameof(IEntry.Placeholder)] = MapPlaceholder,
 			[nameof(IEntry.PlaceholderColor)] = MapPlaceholderColor,
 			[nameof(IEntry.ReturnType)] = MapReturnType,

@@ -5,9 +5,7 @@ using PlatformView = UIKit.UIProgressView;
 using PlatformView = Android.Widget.ProgressBar;
 #elif WINDOWS
 using PlatformView = Microsoft.UI.Xaml.Controls.ProgressBar;
-#elif TIZEN
-using PlatformView = Tizen.UIExtensions.NUI.GraphicsView.ProgressBar;
-#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID && !TIZEN)
+#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID)
 using PlatformView = System.Object;
 #endif
 
@@ -18,7 +16,10 @@ namespace Microsoft.Maui.Handlers
 		public static IPropertyMapper<IProgress, IProgressBarHandler> Mapper = new PropertyMapper<IProgress, ProgressBarHandler>(ViewHandler.ViewMapper)
 		{
 			[nameof(IProgress.Progress)] = MapProgress,
-			[nameof(IProgress.ProgressColor)] = MapProgressColor
+			[nameof(IProgress.ProgressColor)] = MapProgressColor,
+#if __IOS__ || MACCATALYST
+			[nameof(IView.FlowDirection)] = MapFlowDirection,
+#endif
 		};
 
 		public static CommandMapper<IProgress, IProgressBarHandler> CommandMapper = new(ViewCommandMapper)

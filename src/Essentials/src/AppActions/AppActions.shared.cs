@@ -29,6 +29,12 @@ namespace Microsoft.Maui.ApplicationModel
 		/// </summary>
 		/// <param name="actions">A collection of <see cref="AppAction"/> that is to be set for this app.</param>
 		/// <returns>A <see cref="Task"/> object with the current status of the asynchronous operation.</returns>
+		/// <remarks>
+		/// Implementations must complete the returned task when the platform write finishes.
+		/// App-action publications configured through <c>ConfigureEssentials</c> are serialized,
+		/// and this contract has no cancellation token, so a task that never completes prevents
+		/// later configured publications from starting.
+		/// </remarks>
 		Task SetAsync(IEnumerable<AppAction> actions);
 
 		/// <summary>
@@ -51,11 +57,12 @@ namespace Microsoft.Maui.ApplicationModel
 		Task OnLaunched(UI.Xaml.LaunchActivatedEventArgs e);
 #elif IOS || MACCATALYST
 		/// <summary>
-		/// The lifecycle event that is triggered when this app is launched.
+		/// The lifecycle event that is triggered when the user selects an app action.
 		/// </summary>
 		/// <param name="application">The <see cref="UIKit.UIApplication"/> instance this action is performed for.</param>
 		/// <param name="shortcutItem">The shortcut item that was chosen from the app icon.</param>
-		/// <param name="completionHandler">The completion handler that is triggered when this action has completed.</param>
+		/// <param name="completionHandler">Invoked once to report whether the action was handled.</param>
+		/// <remarks>Handler failures are reported as unsuccessful before their exceptions are propagated.</remarks>
 		void PerformActionForShortcutItem(UIKit.UIApplication application, UIKit.UIApplicationShortcutItem shortcutItem, UIKit.UIOperationHandler completionHandler);
 #elif ANDROID
 		/// <summary>
@@ -121,10 +128,10 @@ namespace Microsoft.Maui.ApplicationModel
 		/// Provides the default implementation for static usage of this API.
 		/// </summary>
 		public static IAppActions Current =>
-			currentImplementation ??= new AppActionsImplementation();
+			EssentialsImplementation.GetOrCreate(ref currentImplementation, static () => new AppActionsImplementation());
 
 		internal static void SetCurrent(IAppActions? implementation) =>
-			currentImplementation = implementation;
+			EssentialsImplementation.Set(ref currentImplementation, implementation);
 	}
 
 	/// <summary>
@@ -151,12 +158,12 @@ namespace Microsoft.Maui.ApplicationModel
 			appActions.AsPlatform().OnLaunched(e);
 #elif IOS || MACCATALYST
 		/// <summary>
-		/// The lifecycle event that is triggered when this app is launched.
+		/// The lifecycle event that is triggered when the user selects an app action.
 		/// </summary>
 		/// <param name="appActions">Instance of the <see cref="IAppActions"/> object this event is invoked on.</param>
 		/// <param name="application">The <see cref="UIKit.UIApplication"/> instance this action is performed for.</param>
 		/// <param name="shortcutItem">The shortcut item that was chosen from the app icon.</param>
-		/// <param name="completionHandler">The completion handler that is triggered when this action has completed.</param>
+		/// <param name="completionHandler">Invoked once to report whether the action was handled.</param>
 		public static void PerformActionForShortcutItem(this IAppActions appActions, UIKit.UIApplication application, UIKit.UIApplicationShortcutItem shortcutItem, UIKit.UIOperationHandler completionHandler) =>
 			appActions.AsPlatform().PerformActionForShortcutItem(application, shortcutItem, completionHandler);
 #elif ANDROID

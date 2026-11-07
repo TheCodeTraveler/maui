@@ -46,17 +46,34 @@ namespace Microsoft.Maui.Controls.Platform.Compatibility
 
 			nfloat openLimit = flyoutWidth;
 			nfloat openPixels = openLimit * openPercent;
+			bool isRightToLeft = shell.SemanticContentAttribute == UISemanticContentAttribute.ForceRightToLeft;
 
 			if (behavior == FlyoutBehavior.Locked)
-				shell.Frame = new CGRect(bounds.X + flyoutWidth, bounds.Y, bounds.Width - flyoutWidth, flyoutHeight);
+			{
+				nfloat shellPositionX = isRightToLeft
+					? bounds.X
+					: bounds.X + flyoutWidth;
+				shell.Frame = new CGRect(shellPositionX, bounds.Y, bounds.Width - flyoutWidth, flyoutHeight);
+			}
 			else
 				shell.Frame = bounds;
 
 			var shellWidth = shell.Frame.Width;
 
-			if (shell.SemanticContentAttribute == UISemanticContentAttribute.ForceRightToLeft)
+			if (isRightToLeft)
 			{
 				var positionX = shellWidth - openPixels;
+
+				if (behavior == FlyoutBehavior.Locked)
+				{
+					// In RTL (ForceRightToLeft), iOS mirrors the coordinate system so that x=0 is
+					// visually on the right. Setting positionX = shellWidth places the flyout's
+					// leading edge at the right boundary of the shell content area, which renders
+					// at the left (leading) edge of the screen in the mirrored coordinate space.
+					// This correctly anchors the locked flyout to the trailing side in RTL layout.
+					positionX = shellWidth;
+				}
+
 				flyout.Frame = new CGRect(positionX, 0, flyoutWidth, flyoutHeight);
 			}
 			else

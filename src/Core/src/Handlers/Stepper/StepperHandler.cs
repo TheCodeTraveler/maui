@@ -4,9 +4,7 @@ using PlatformView = UIKit.UIStepper;
 using PlatformView = Microsoft.Maui.Platform.MauiStepper;
 #elif WINDOWS
 using PlatformView = Microsoft.Maui.Platform.MauiStepper;
-#elif TIZEN
-using PlatformView = Microsoft.Maui.Platform.MauiStepper;
-#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID && !TIZEN)
+#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID)
 using PlatformView = System.Object;
 #endif
 
@@ -24,6 +22,8 @@ namespace Microsoft.Maui.Handlers
 			[nameof(IStepper.IsEnabled)] = MapIsEnabled,
 #elif WINDOWS
 			[nameof(IStepper.Background)] = MapBackground,
+#elif __IOS__ || MACCATALYST
+			[nameof(IStepper.FlowDirection)] = MapFlowDirection,
 #endif
 		};
 

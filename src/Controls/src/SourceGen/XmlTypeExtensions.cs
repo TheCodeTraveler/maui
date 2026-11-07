@@ -67,9 +67,24 @@ static class XmlTypeExtensions
 			if (types.Length == 1)
 			{
 				symbol = types[0];
+				// If the match is via the "Extension" suffix but the type is static, it cannot be
+				// an IMarkupExtension (static types cannot implement interfaces). In that case, skip
+				// this match and continue to try the exact name. This prevents a static helper class
+				// like MyEnumExtension from being returned instead of the MyEnum enum type. (#34021)
+				if (suffix == "Extension" && symbol.IsStatic)
+					continue;
 				if (symbol.IsGenericType && xmlType.TypeArguments is not null)
 				{
-					var typeArgs = xmlType.TypeArguments.Select(typeArg => typeArg.GetTypeSymbol(reportDiagnostic, compilation, xmlnsCache, typeCache)!).ToArray();
+					var typeArgs = new ITypeSymbol[xmlType.TypeArguments.Count];
+					for (var i = 0; i < typeArgs.Length; i++)
+					{
+						if (!xmlType.TypeArguments[i].TryResolveTypeSymbol(reportDiagnostic, compilation, xmlnsCache, typeCache, out var typeArg))
+						{
+							symbol = null;
+							return false;
+						}
+						typeArgs[i] = typeArg!;
+					}
 					symbol = symbol.Construct(typeArgs);
 				}
 				typeCache[xmlType] = symbol;

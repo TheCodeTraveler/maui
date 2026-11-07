@@ -383,6 +383,9 @@ namespace Microsoft.Maui.Platform
 			{
 				NavigationViewControl.OnApplyTemplateFinished -= OnNavigationViewControlOnApplyTemplateFinished;
 				NavigationViewControl.ButtonHolderGrid!.SizeChanged += OnButtonHolderGridSizeChanged;
+
+				// Need to update the background color for the buttons after the template is applied
+				UpdateBackgroundColorForButtons();
 			}
 
 			ContentChanged?.Invoke(this, EventArgs.Empty);
@@ -463,6 +466,18 @@ namespace Microsoft.Maui.Platform
 					UpdateAppTitleBarTemplate();
 				}
 				return;
+			}
+
+			if (_titleBar is IView titleBarView && titleBarView.Handler?.MauiContext is { } currentContext && currentContext != mauiContext)
+			{
+				if (currentContext.GetNavigationRootManager()?.RootView is WindowRootView currentRootView &&
+					!ReferenceEquals(currentRootView, this) &&
+					ReferenceEquals(currentRootView.TitleBar, titlebar))
+				{
+					currentRootView.SetTitleBar(null, null);
+				}
+
+				titleBarView.DisconnectHandlers();
 			}
 
 			var handler = _titleBar?.ToHandler(mauiContext);

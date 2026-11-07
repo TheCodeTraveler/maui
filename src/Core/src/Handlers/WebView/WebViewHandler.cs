@@ -4,9 +4,7 @@ using PlatformView = WebKit.WKWebView;
 using PlatformView = Android.Webkit.WebView;
 #elif WINDOWS
 using PlatformView = Microsoft.UI.Xaml.Controls.WebView2;
-#elif TIZEN
-using PlatformView = Microsoft.Maui.Platform.MauiWebView;
-#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID && !TIZEN)
+#elif (NETSTANDARD || !PLATFORM) || (NET6_0_OR_GREATER && !IOS && !ANDROID)
 using PlatformView = System.Object;
 #endif
 
@@ -26,12 +24,12 @@ namespace Microsoft.Maui.Handlers
 			[nameof(IWebView.UserAgent)] = MapUserAgent,
 #if WINDOWS
 	[nameof(IView.FlowDirection)] = MapFlowDirection,
+	[nameof(IView.Background)] = MapBackground,
 #endif
 #if __ANDROID__
-			[nameof(WebViewClient)] = MapWebViewClient,
-			[nameof(WebChromeClient)] = MapWebChromeClient,
 			[nameof(WebView.Settings)] =  MapWebViewSettings
-#elif __IOS__
+#elif __IOS__ || MACCATALYST
+			[nameof(IWebView.FlowDirection)] = MapFlowDirection,
 			[nameof(WKUIDelegate)] = MapWKUIDelegate,
 			[nameof(IWebView.Background)] = MapBackground,
 #endif

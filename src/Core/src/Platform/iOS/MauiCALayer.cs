@@ -250,6 +250,10 @@ namespace Microsoft.Maui.Platform
 
 				_strokeDash = dashArray;
 			}
+			else if (borderDashArray is null || borderDashArray.Length == 0)
+			{
+				_strokeDash = null;
+			}
 
 			SetNeedsDisplay();
 		}
@@ -310,7 +314,9 @@ namespace Microsoft.Maui.Platform
 			if (_shape.TryGetTarget(out var shape))
 			{
 				var bounds = _bounds.ToRectangle();
-				var path = shape.PathForBounds(bounds);
+				var path = shape is IShapeWithStroke shapeWithStroke
+					? shapeWithStroke.PathForBounds(bounds, includeStroke: true)
+					: shape.PathForBounds(bounds);
 				return path?.AsCGPath();
 			}
 
